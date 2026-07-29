@@ -348,9 +348,14 @@ function installChatGPTTabCompletionBridge(): void {
     pending.maxWaitTimerId = window.setTimeout(() => {
       if (pendingTabCompletions.get(manager) !== pending) return
 
-      console.warn("[TabManager] ChatGPT 完成确认等待超时，释放标签页状态")
-      clearApprovalTransitionLatch()
-      finishPending(manager, pending, true)
+      const signals = getChatGPTComposerSignals()
+      if (isChatGPTCompletionConfirmed(signals)) {
+        finishPending(manager, pending, true)
+        return
+      }
+
+      console.warn("[TabManager] ChatGPT 完成确认等待超时，保留未完成状态")
+      finishPending(manager, pending, false)
     }, TAB_COMPLETION_MAX_WAIT_MS)
 
     pendingTabCompletions.set(manager, pending)
