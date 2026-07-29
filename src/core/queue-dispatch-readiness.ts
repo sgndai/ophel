@@ -9,6 +9,7 @@ export type QueueDispatchReadinessState =
   | "ready"
   | "generating"
   | "awaiting-approval"
+  | "tool-transition"
   | "unknown"
 
 export interface QueueDispatchReadiness {
@@ -18,6 +19,7 @@ export interface QueueDispatchReadiness {
     | "chatgpt-ready"
     | "chatgpt-generating"
     | "chatgpt-awaiting-approval"
+    | "chatgpt-tool-transition"
     | "chatgpt-unknown"
     | "adapter-generating"
     | "adapter-idle"
@@ -52,7 +54,9 @@ export function getQueueDispatchReadiness(
             ? "chatgpt-generating"
             : state === "awaiting-approval"
               ? "chatgpt-awaiting-approval"
-              : "chatgpt-unknown",
+              : state === "tool-transition"
+                ? "chatgpt-tool-transition"
+                : "chatgpt-unknown",
       signals: {
         hasStopButton: signals.hasStopButton,
         hasSendButton: signals.hasSendButton,
