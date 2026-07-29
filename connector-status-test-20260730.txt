@@ -1,3 +1,0 @@
-Temporary GitHub connector status test.
-Created on 2026-07-30 for verifying Ophel tab-state behavior during an approval-gated write operation.
-This file is safe to delete after the test.
