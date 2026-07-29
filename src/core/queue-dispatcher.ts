@@ -300,15 +300,19 @@ export class QueueDispatcher {
     const startedAt = Date.now()
     let lastActivityAt = startedAt
     let lastSignature = this.getConversationActivitySignature()
-    let sawGenerating = this.adapter.isGenerating()
+    let readiness = getQueueDispatchReadiness(this.adapter)
+    let sawBusyState = !readiness.canAcceptQueueItem
 
     while (Date.now() - startedAt < this.POST_SUBMIT_MAX_WAIT_MS) {
       await new Promise((resolve) => setTimeout(resolve, 500))
 
       const now = Date.now()
-      const isGenerating = this.adapter.isGenerating()
-      if (isGenerating) {
-        sawGenerating = true
+      readiness = getQueueDispatchReadiness(this.adapter)
+
+      // generating、awaiting-approval、tool-transition 与 unknown 都属于未完成状态。
+      // 只要还不能接收下一条，就持续刷新活动时间，避免审批/工具阶段被静默窗口误判。
+      if (!readiness.canAcceptQueueItem) {
+        sawBusyState = true
         lastActivityAt = now
       }
 
@@ -320,13 +324,13 @@ export class QueueDispatcher {
 
       const waited = now - startedAt
       const quietFor = now - lastActivityAt
-      const generationWasObservable = sawGenerating || waited >= this.GENERATION_START_GRACE_MS
+      const activityWasObservable = sawBusyState || waited >= this.GENERATION_START_GRACE_MS
 
       if (
         waited >= this.POST_SUBMIT_MIN_WAIT_MS &&
         quietFor >= this.POST_SUBMIT_QUIET_MS &&
-        !isGenerating &&
-        generationWasObservable
+        readiness.canAcceptQueueItem &&
+        activityWasObservable
       ) {
         return
       }
