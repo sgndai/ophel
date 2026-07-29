@@ -16,6 +16,8 @@ export interface ChatGPTComposerSignals {
   hasPendingApproval: boolean
   hasComposer: boolean
   hasIdleAction: boolean
+  hasActiveAssistantTurn: boolean
+  hasLatestAssistantMessage: boolean
   hasLatestAssistantCompletionAction: boolean
   approvalTransitionActive: boolean
 }
@@ -46,22 +48,24 @@ const COMPOSER_SELECTORS = [
 
 const APPROVAL_CARD_SELECTOR = '[data-testid="tool-approval-card"]'
 const APPROVAL_ACTIONS_SELECTOR = '[data-testid="tool-action-buttons"]'
+const ASSISTANT_TURN_SELECTOR = '[data-turn="assistant"]'
 const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]'
-const ASSISTANT_TURN_SELECTOR = '[data-turn="assistant"], [data-testid^="conversation-turn-"]'
+const ACTIVE_ASSISTANT_RESPONSE_SELECTOR =
+  '[data-turn="assistant"] [data-streaming-response-status]'
 const COMPLETION_ACTION_SELECTOR = '[data-testid="copy-turn-action-button"]'
-const TAB_COMPLETION_SETTLE_MS = 400
+const TAB_COMPLETION_SETTLE_MS = 1600
 const TAB_COMPLETION_POLL_MS = 250
-const TAB_COMPLETION_MAX_WAIT_MS = 10 * 60 * 1000
 
 interface ApprovalTransitionLatch {
   conversationKey: string
   active: boolean
   assistantTurnKey: string | null
+  assistantTurnIndex: number | null
 }
 
 interface PendingTabCompletion {
-  startedAt: number
   timerId: number
+  quietSince: number | null
 }
 
 interface ChatGPTAdapterBridgePrototype {
@@ -74,10 +78,18 @@ interface TabManagerBridgePrototype {
   __ophelChatGPTCompletionBridgeInstalled__?: boolean
 }
 
+interface LatestAssistantTurnSignals {
+  key: string | null
+  index: number | null
+  hasAssistantMessage: boolean
+  hasCompletionAction: boolean
+}
+
 const approvalTransitionLatch: ApprovalTransitionLatch = {
   conversationKey: "",
   active: false,
   assistantTurnKey: null,
+  assistantTurnIndex: null,
 }
 
 const pendingTabCompletions = new WeakMap<TabManager, PendingTabCompletion>()
@@ -94,6 +106,7 @@ function syncApprovalTransitionConversation(): void {
   approvalTransitionLatch.conversationKey = conversationKey
   approvalTransitionLatch.active = false
   approvalTransitionLatch.assistantTurnKey = null
+  approvalTransitionLatch.assistantTurnIndex = null
 }
 
 function isElementVisible(element: Element | null): element is HTMLElement {
@@ -132,39 +145,83 @@ function isButtonEnabled(button: HTMLButtonElement): boolean {
   )
 }
 
-function getLatestAssistantTurn(root: ParentNode): {
-  key: string | null
-  hasCompletionAction: boolean
-} {
-  const assistantMessages = root.querySelectorAll(ASSISTANT_MESSAGE_SELECTOR)
-  const latestMessage = assistantMessages[assistantMessages.length - 1]
-  if (!(latestMessage instanceof HTMLElement)) {
-    return { key: null, hasCompletionAction: false }
+function parseTurnIndex(turn: Element): number | null {
+  const testId = turn.getAttribute("data-testid") || ""
+  const match = testId.match(/^conversation-turn-(\d+)$/)
+  if (!match) return null
+
+  const index = Number.parseInt(match[1], 10)
+  return Number.isFinite(index) ? index : null
+}
+
+function getLatestAssistantTurn(root: ParentNode): LatestAssistantTurnSignals {
+  const turns = Array.from(root.querySelectorAll(ASSISTANT_TURN_SELECTOR)).filter(
+    (turn) => turn instanceof HTMLElement && turn.isConnected && !turn.closest(".gh-main-panel"),
+  )
+  const latestTurn = turns[turns.length - 1]
+
+  if (!(latestTurn instanceof HTMLElement)) {
+    return {
+      key: null,
+      index: null,
+      hasAssistantMessage: false,
+      hasCompletionAction: false,
+    }
   }
 
-  const turn = latestMessage.closest(ASSISTANT_TURN_SELECTOR) || latestMessage
   const key =
-    turn.getAttribute("data-turn-id") ||
-    turn.getAttribute("data-turn-id-container") ||
-    turn.getAttribute("data-testid") ||
-    latestMessage.getAttribute("data-message-id")
-  const completionAction = turn.querySelector(COMPLETION_ACTION_SELECTOR)
+    latestTurn.getAttribute("data-turn-id") ||
+    latestTurn.getAttribute("data-turn-id-container") ||
+    latestTurn.getAttribute("data-testid")
+  const assistantMessage = latestTurn.querySelector(ASSISTANT_MESSAGE_SELECTOR)
+  const completionAction = latestTurn.querySelector(COMPLETION_ACTION_SELECTOR)
   const hasCompletionAction =
     completionAction instanceof HTMLButtonElement &&
     completionAction.isConnected &&
     isButtonEnabled(completionAction)
 
-  return { key, hasCompletionAction }
+  return {
+    key,
+    index: parseTurnIndex(latestTurn),
+    hasAssistantMessage: assistantMessage instanceof HTMLElement && assistantMessage.isConnected,
+    hasCompletionAction,
+  }
+}
+
+function isTurnAtOrAfterApproval(latestTurn: LatestAssistantTurnSignals): boolean {
+  if (
+    approvalTransitionLatch.assistantTurnIndex !== null &&
+    latestTurn.index !== null
+  ) {
+    return latestTurn.index >= approvalTransitionLatch.assistantTurnIndex
+  }
+
+  if (approvalTransitionLatch.assistantTurnKey && latestTurn.key) {
+    return latestTurn.key === approvalTransitionLatch.assistantTurnKey
+  }
+
+  return true
 }
 
 function isChatGPTBusyState(state: ChatGPTRunState): boolean {
   return state === "generating" || state === "awaiting-approval" || state === "tool-transition"
 }
 
-function getTabManagerAdapter(manager: TabManager): { getSiteId?: () => string } | null {
+function isChatGPTCompletionConfirmed(signals: ChatGPTComposerSignals): boolean {
+  if (isChatGPTBusyState(signals.state)) return false
+
   return (
-    (manager as unknown as { adapter?: { getSiteId?: () => string } }).adapter || null
+    signals.state === "ready" ||
+    (signals.hasLatestAssistantMessage &&
+      !signals.hasStopButton &&
+      !signals.hasPendingApproval &&
+      !signals.hasActiveAssistantTurn &&
+      !signals.approvalTransitionActive)
   )
+}
+
+function getTabManagerAdapter(manager: TabManager): { getSiteId?: () => string } | null {
+  return (manager as unknown as { adapter?: { getSiteId?: () => string } }).adapter || null
 }
 
 function installChatGPTAdapterRunStateBridge(): void {
@@ -196,23 +253,30 @@ function installChatGPTTabCompletionBridge(): void {
 
     if (pendingTabCompletions.has(this)) return
 
-    const startedAt = Date.now()
+    const pending: PendingTabCompletion = {
+      timerId: 0,
+      quietSince: null,
+    }
+
     const poll = () => {
       const signals = getChatGPTComposerSignals()
-      const timedOut = Date.now() - startedAt >= TAB_COMPLETION_MAX_WAIT_MS
 
-      if (signals.state === "ready" || timedOut) {
+      if (!isChatGPTCompletionConfirmed(signals)) {
+        pending.quietSince = null
+      } else if (pending.quietSince === null) {
+        pending.quietSince = Date.now()
+      } else if (Date.now() - pending.quietSince >= TAB_COMPLETION_SETTLE_MS) {
         pendingTabCompletions.delete(this)
         originalOnAiComplete.call(this)
         return
       }
 
-      const timerId = window.setTimeout(poll, TAB_COMPLETION_POLL_MS)
-      pendingTabCompletions.set(this, { startedAt, timerId })
+      pending.timerId = window.setTimeout(poll, TAB_COMPLETION_POLL_MS)
+      pendingTabCompletions.set(this, pending)
     }
 
-    const timerId = window.setTimeout(poll, TAB_COMPLETION_SETTLE_MS)
-    pendingTabCompletions.set(this, { startedAt, timerId })
+    pending.timerId = window.setTimeout(poll, TAB_COMPLETION_POLL_MS)
+    pendingTabCompletions.set(this, pending)
   }
 
   prototype.__ophelChatGPTCompletionBridgeInstalled__ = true
@@ -251,36 +315,41 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
   const hasSendButton = findVisibleChatGPTSendButton(root) !== null
   const hasComposer = findVisibleElement(root, COMPOSER_SELECTORS) !== null
   const hasIdleAction = findVisibleElement(root, IDLE_ACTION_SELECTORS) !== null
+  const hasActiveAssistantTurn =
+    findVisibleElement(root, [ACTIVE_ASSISTANT_RESPONSE_SELECTOR]) !== null
   const latestAssistantTurn = getLatestAssistantTurn(root)
 
   if (hasPendingApproval) {
     approvalTransitionLatch.active = true
     approvalTransitionLatch.assistantTurnKey = latestAssistantTurn.key
+    approvalTransitionLatch.assistantTurnIndex = latestAssistantTurn.index
   } else if (
     approvalTransitionLatch.active &&
     !hasStopButton &&
-    latestAssistantTurn.hasCompletionAction &&
-    (!approvalTransitionLatch.assistantTurnKey ||
-      !latestAssistantTurn.key ||
-      latestAssistantTurn.key === approvalTransitionLatch.assistantTurnKey)
+    !hasActiveAssistantTurn &&
+    latestAssistantTurn.hasAssistantMessage &&
+    isTurnAtOrAfterApproval(latestAssistantTurn)
   ) {
     approvalTransitionLatch.active = false
     approvalTransitionLatch.assistantTurnKey = null
+    approvalTransitionLatch.assistantTurnIndex = null
   }
 
   let state: ChatGPTRunState = "unknown"
 
   if (hasPendingApproval) {
     state = "awaiting-approval"
-  } else if (hasStopButton) {
+  } else if (hasStopButton || hasActiveAssistantTurn) {
+    // 网页搜索和工具调用期间，ChatGPT 可能恢复 send-button 并移除 stop-button，
+    // 但当前助手回合仍保留 data-streaming-response-status。
     state = "generating"
   } else if (approvalTransitionLatch.active) {
-    // 审批卡消失不等于工具调用完成。等待同一条 AI 回复出现复制操作，
-    // 以此确认该回复已经真正收尾，再允许队列继续消费。
+    // 审批卡消失不等于工具调用完成。等待对应助手回合转为正式的
+    // data-message-author-role="assistant"，而不是依赖后台可能延迟挂载的复制按钮。
     state = "tool-transition"
   } else if (hasComposer && hasIdleAction) {
-    // ChatGPT 空输入时通常显示语音按钮；队列内容插入后才切换为 send-button。
-    // 因此这里表示“可接收队列内容”，实际提交仍需再次确认 send-button。
+    // send-button 只代表当前允许继续输入，并不代表上一轮任务已经完成。
+    // 只有在不存在活动助手回合、审批和工具过渡时，才可接收队列内容。
     state = "ready"
   }
 
@@ -291,6 +360,8 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
     hasPendingApproval,
     hasComposer,
     hasIdleAction,
+    hasActiveAssistantTurn,
+    hasLatestAssistantMessage: latestAssistantTurn.hasAssistantMessage,
     hasLatestAssistantCompletionAction: latestAssistantTurn.hasCompletionAction,
     approvalTransitionActive: approvalTransitionLatch.active,
   }
