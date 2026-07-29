@@ -1,3 +1,7 @@
+import { ChatGPTAdapter } from "~adapters/chatgpt"
+import { SITE_IDS } from "~constants"
+import { TabManager } from "~core/tab-manager"
+
 export type ChatGPTRunState =
   | "generating"
   | "awaiting-approval"
@@ -45,6 +49,9 @@ const APPROVAL_ACTIONS_SELECTOR = '[data-testid="tool-action-buttons"]'
 const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]'
 const ASSISTANT_TURN_SELECTOR = '[data-turn="assistant"], [data-testid^="conversation-turn-"]'
 const COMPLETION_ACTION_SELECTOR = '[data-testid="copy-turn-action-button"]'
+const TAB_COMPLETION_SETTLE_MS = 400
+const TAB_COMPLETION_POLL_MS = 250
+const TAB_COMPLETION_MAX_WAIT_MS = 10 * 60 * 1000
 
 interface ApprovalTransitionLatch {
   conversationKey: string
@@ -52,11 +59,28 @@ interface ApprovalTransitionLatch {
   assistantTurnKey: string | null
 }
 
+interface PendingTabCompletion {
+  startedAt: number
+  timerId: number
+}
+
+interface ChatGPTAdapterBridgePrototype {
+  isGenerating(this: ChatGPTAdapter): boolean
+  __ophelRunStateBridgeInstalled__?: boolean
+}
+
+interface TabManagerBridgePrototype {
+  onAiComplete(this: TabManager): void
+  __ophelChatGPTCompletionBridgeInstalled__?: boolean
+}
+
 const approvalTransitionLatch: ApprovalTransitionLatch = {
   conversationKey: "",
   active: false,
   assistantTurnKey: null,
 }
+
+const pendingTabCompletions = new WeakMap<TabManager, PendingTabCompletion>()
 
 function getConversationKey(): string {
   if (typeof window === "undefined") return "document"
@@ -133,6 +157,67 @@ function getLatestAssistantTurn(root: ParentNode): {
   return { key, hasCompletionAction }
 }
 
+function isChatGPTBusyState(state: ChatGPTRunState): boolean {
+  return state === "generating" || state === "awaiting-approval" || state === "tool-transition"
+}
+
+function getTabManagerAdapter(manager: TabManager): { getSiteId?: () => string } | null {
+  return (
+    (manager as unknown as { adapter?: { getSiteId?: () => string } }).adapter || null
+  )
+}
+
+function installChatGPTAdapterRunStateBridge(): void {
+  const prototype = ChatGPTAdapter.prototype as unknown as ChatGPTAdapterBridgePrototype
+  if (prototype.__ophelRunStateBridgeInstalled__) return
+
+  const originalIsGenerating = prototype.isGenerating
+  prototype.isGenerating = function isGeneratingWithToolState(this: ChatGPTAdapter): boolean {
+    if (originalIsGenerating.call(this)) return true
+
+    const signals = getChatGPTComposerSignals()
+    return isChatGPTBusyState(signals.state)
+  }
+  prototype.__ophelRunStateBridgeInstalled__ = true
+}
+
+function installChatGPTTabCompletionBridge(): void {
+  const prototype = TabManager.prototype as unknown as TabManagerBridgePrototype
+  if (prototype.__ophelChatGPTCompletionBridgeInstalled__) return
+
+  const originalOnAiComplete = prototype.onAiComplete
+
+  prototype.onAiComplete = function onAiCompleteAfterChatGPTSettles(this: TabManager): void {
+    const adapter = getTabManagerAdapter(this)
+    if (adapter?.getSiteId?.() !== SITE_IDS.CHATGPT) {
+      originalOnAiComplete.call(this)
+      return
+    }
+
+    if (pendingTabCompletions.has(this)) return
+
+    const startedAt = Date.now()
+    const poll = () => {
+      const signals = getChatGPTComposerSignals()
+      const timedOut = Date.now() - startedAt >= TAB_COMPLETION_MAX_WAIT_MS
+
+      if (signals.state === "ready" || timedOut) {
+        pendingTabCompletions.delete(this)
+        originalOnAiComplete.call(this)
+        return
+      }
+
+      const timerId = window.setTimeout(poll, TAB_COMPLETION_POLL_MS)
+      pendingTabCompletions.set(this, { startedAt, timerId })
+    }
+
+    const timerId = window.setTimeout(poll, TAB_COMPLETION_SETTLE_MS)
+    pendingTabCompletions.set(this, { startedAt, timerId })
+  }
+
+  prototype.__ophelChatGPTCompletionBridgeInstalled__ = true
+}
+
 export function hasPendingChatGPTToolApproval(root: ParentNode = document): boolean {
   const cards = root.querySelectorAll(APPROVAL_CARD_SELECTOR)
 
@@ -173,6 +258,7 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
     approvalTransitionLatch.assistantTurnKey = latestAssistantTurn.key
   } else if (
     approvalTransitionLatch.active &&
+    !hasStopButton &&
     latestAssistantTurn.hasCompletionAction &&
     (!approvalTransitionLatch.assistantTurnKey ||
       !latestAssistantTurn.key ||
@@ -213,3 +299,6 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
 export function isChatGPTReadyForQueueItem(root: ParentNode = document): boolean {
   return getChatGPTComposerSignals(root).state === "ready"
 }
+
+installChatGPTAdapterRunStateBridge()
+installChatGPTTabCompletionBridge()
