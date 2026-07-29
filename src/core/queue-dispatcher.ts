@@ -19,6 +19,7 @@ import { useSettingsStore } from "~stores/settings-store"
 import type { QueueItem } from "~stores/queue-store"
 import { useQueueStore } from "~stores/queue-store"
 import { EVENT_MONITOR_COMPLETE, EVENT_MONITOR_START } from "~utils/messaging"
+import { showToast } from "~utils/toast"
 
 export class QueueDispatcher {
   private adapter: SiteAdapter
@@ -108,6 +109,23 @@ export class QueueDispatcher {
 
   private canAcceptQueueItem(): boolean {
     return getQueueDispatchReadiness(this.adapter).canAcceptQueueItem
+  }
+
+  private pauseQueueForSafety(message: string): void {
+    const store = useQueueStore.getState()
+    const hasQueuedWork = store.items.some(
+      (item) => item.status === "pending" || item.status === "sending",
+    )
+
+    if (hasQueuedWork) {
+      store.pause()
+      showToast(`${message}，提示词队列已暂停，请确认后手动恢复。`, 6000, {
+        maxWidth: 560,
+      })
+      return
+    }
+
+    showToast(`${message}，请检查当前回复状态。`, 5000, { maxWidth: 520 })
   }
 
   /**
@@ -400,8 +418,8 @@ export class QueueDispatcher {
         if (done) return
 
         if (this.getConversationKey() !== conversationKey) {
-          console.warn("[QueueDispatcher] 对话已切换，暂停队列以避免发送到错误会话")
-          useQueueStore.getState().pause()
+          console.warn("[QueueDispatcher] 对话已切换，停止等待并保护后续队列")
+          this.pauseQueueForSafety("检测到对话已切换")
           finish()
           return
         }
@@ -475,7 +493,6 @@ export class QueueDispatcher {
         observer.observe(observationRoot, {
           childList: true,
           subtree: true,
-          characterData: true,
           attributes: true,
           attributeFilter: ["aria-disabled", "disabled", "data-disabled", "data-testid"],
         })
@@ -496,7 +513,8 @@ export class QueueDispatcher {
         this.POST_SUBMIT_FALLBACK_CHECK_MS,
       )
       maxWaitTimerId = window.setTimeout(() => {
-        console.warn("[QueueDispatcher] 等待回复结束超时，释放队列调度锁")
+        console.warn("[QueueDispatcher] 等待回复结束超时，停止等待并保护后续队列")
+        this.pauseQueueForSafety("等待 AI 回复结束超时")
         finish()
       }, this.POST_SUBMIT_MAX_WAIT_MS)
 
