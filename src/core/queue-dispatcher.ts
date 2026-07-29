@@ -2,7 +2,7 @@
  * Queue Dispatcher - 队列调度引擎
  *
  * 负责在 AI 空闲时自动从队列中取出提示词并发送。
- * 使用防抖机制：连续 2 秒检测到 isGenerating() === false 才触发发送。
+ * 使用防抖机制：连续 2 秒检测到队列可调度状态才触发发送。
  */
 
 import type { SiteAdapter } from "~adapters/base"
@@ -13,23 +13,29 @@ import {
   rememberQuickQuoteReferenceForContent,
   stripQuickQuoteMarkers,
 } from "~core/quick-quote-marker"
+import { getQueueDispatchReadiness } from "~core/queue-dispatch-readiness"
+import { submitQueuePrompt } from "~core/queue-submit"
 import { useSettingsStore } from "~stores/settings-store"
 import type { QueueItem } from "~stores/queue-store"
 import { useQueueStore } from "~stores/queue-store"
+import { EVENT_MONITOR_COMPLETE, EVENT_MONITOR_START } from "~utils/messaging"
 
 export class QueueDispatcher {
   private adapter: SiteAdapter
   private promptManager: PromptManager
   private readonly pollingTasks = new PollingTaskRegistry()
+  private queueStoreUnsubscribe: (() => void) | null = null
   private idleCount = 0 // 连续空闲计数
   private isDispatching = false
   private postSubmitWaitPromise: Promise<void> | null = null
+  private postSubmitWaitCancel: (() => void) | null = null
   private readonly IDLE_THRESHOLD = 2 // 需要连续 N 次检测到空闲才发送
   private readonly POLL_TASK_NAME = "queue-dispatcher"
   private readonly POLL_INTERVAL = 1000 // 轮询间隔 (ms)
   private readonly POST_SUBMIT_MIN_WAIT_MS = 2500
   private readonly POST_SUBMIT_QUIET_MS = 2500
   private readonly GENERATION_START_GRACE_MS = 8000
+  private readonly POST_SUBMIT_FALLBACK_CHECK_MS = 15_000
   private readonly POST_SUBMIT_MAX_WAIT_MS = 10 * 60 * 1000
 
   constructor(adapter: SiteAdapter, promptManager: PromptManager) {
@@ -38,11 +44,48 @@ export class QueueDispatcher {
   }
 
   /**
-   * 启动调度循环
+   * 启动调度器。常驻部分仅订阅队列状态；实际轮询仅在队列有待处理项目时存在。
    */
   start(): void {
-    if (this.isRunning()) return // 已在运行
+    if (this.isRunning()) return
+
     this.idleCount = 0
+    this.queueStoreUnsubscribe = useQueueStore.subscribe(() => {
+      this.syncPollingWithQueueState()
+    })
+    this.syncPollingWithQueueState()
+  }
+
+  /**
+   * 停止调度器并清理全部临时任务。
+   */
+  stop(): void {
+    this.queueStoreUnsubscribe?.()
+    this.queueStoreUnsubscribe = null
+    this.pollingTasks.stop(this.POLL_TASK_NAME)
+    this.postSubmitWaitCancel?.()
+    this.idleCount = 0
+  }
+
+  /**
+   * 判断调度器是否已启用。队列为空时轮询会停止，但调度器仍保持队列订阅。
+   */
+  isRunning(): boolean {
+    return this.queueStoreUnsubscribe !== null
+  }
+
+  private hasRunnableQueueWork(): boolean {
+    const state = useQueueStore.getState()
+    if (state.isPaused) return false
+
+    return state.items.some((item) => item.status === "pending" || item.status === "sending")
+  }
+
+  private startPollingLoop(): void {
+    if (!this.isRunning()) return
+    if (this.postSubmitWaitPromise) return
+    if (this.pollingTasks.isRunning(this.POLL_TASK_NAME)) return
+
     this.pollingTasks.start({
       name: this.POLL_TASK_NAME,
       intervalMs: this.POLL_INTERVAL,
@@ -51,23 +94,24 @@ export class QueueDispatcher {
     })
   }
 
-  /**
-   * 停止调度循环
-   */
-  stop(): void {
-    this.pollingTasks.stop(this.POLL_TASK_NAME)
-    this.idleCount = 0
+  private syncPollingWithQueueState(): void {
+    if (!this.isRunning()) return
+
+    if (!this.hasRunnableQueueWork() || this.postSubmitWaitPromise) {
+      this.pollingTasks.stop(this.POLL_TASK_NAME)
+      if (!this.hasRunnableQueueWork()) this.idleCount = 0
+      return
+    }
+
+    this.startPollingLoop()
+  }
+
+  private canAcceptQueueItem(): boolean {
+    return getQueueDispatchReadiness(this.adapter).canAcceptQueueItem
   }
 
   /**
-   * 检查是否正在运行
-   */
-  isRunning(): boolean {
-    return this.pollingTasks.isRunning(this.POLL_TASK_NAME)
-  }
-
-  /**
-   * 每秒执行的轮询逻辑
+   * 仅在队列中存在待处理项目时，每秒执行一次。
    */
   private async tick(): Promise<void> {
     if (this.isDispatching) return
@@ -77,6 +121,7 @@ export class QueueDispatcher {
 
     if (state.isPaused) {
       this.idleCount = 0
+      this.syncPollingWithQueueState()
       return
     }
 
@@ -87,10 +132,11 @@ export class QueueDispatcher {
       return
     }
 
-    // 如果队列为空，重置计数
+    // 如果队列为空，立即停止轮询。
     const pendingItems = state.items.filter((i) => i.status === "pending")
     if (pendingItems.length === 0) {
       this.idleCount = 0
+      this.syncPollingWithQueueState()
       return
     }
 
@@ -100,11 +146,9 @@ export class QueueDispatcher {
       return
     }
 
-    // 检测 AI 是否正在生成
-    const isGenerating = this.adapter.isGenerating()
-
-    if (isGenerating) {
-      // AI 正在生成，重置空闲计数
+    // ChatGPT 只有在 composer 明确可接收新提示词时才允许调度。
+    // 其他站点继续沿用 adapter.isGenerating() 的兼容判断。
+    if (!this.canAcceptQueueItem()) {
       this.idleCount = 0
       return
     }
@@ -131,10 +175,9 @@ export class QueueDispatcher {
 
     this.isDispatching = true
     try {
-      // 二次确认：插入前再次检查 AI 是否真的空闲
-      // 防止从 tick() 到这里的时间差内 AI 开始生成
-      if (this.adapter.isGenerating()) {
-        // AI 已经在生成了，把项目放回队列
+      // 二次确认：插入前再次检查页面是否仍可接收队列项目，
+      // 防止从 tick() 到这里的时间差内进入生成、审批或未知状态。
+      if (!this.canAcceptQueueItem()) {
         store.updateStatus(item.id, "pending")
         this.idleCount = 0
         return
@@ -170,8 +213,8 @@ export class QueueDispatcher {
       const submitShortcut =
         useSettingsStore.getState().settings.features?.prompts?.submitShortcut ?? "enter"
 
-      // 提交发送
-      const submitOk = await this.promptManager.submitPrompt(submitShortcut)
+      // 队列提交在 ChatGPT 上只允许点击明确可用的 send-button；其他站点保持原逻辑。
+      const submitOk = await submitQueuePrompt(this.adapter, this.promptManager, submitShortcut)
       if (!submitOk) {
         // 插入后确认超时分两类：内容仍在编辑器中才保留 sending 等待重试；
         // 编辑器已清空通常表示站点已接收，只是确认窗口太短。
@@ -227,7 +270,7 @@ export class QueueDispatcher {
   }
 
   private async recoverSendingItem(item: QueueItem): Promise<void> {
-    if (this.adapter.isGenerating()) {
+    if (!this.canAcceptQueueItem()) {
       this.idleCount = 0
       return
     }
@@ -263,7 +306,7 @@ export class QueueDispatcher {
         await this.promptManager.insertPrompt(editorContent)
       }
 
-      const submitOk = await this.promptManager.submitPrompt(submitShortcut)
+      const submitOk = await submitQueuePrompt(this.adapter, this.promptManager, submitShortcut)
 
       if (!submitOk) return
 
@@ -276,70 +319,205 @@ export class QueueDispatcher {
     }
   }
 
-  private getConversationActivitySignature(): string {
-    const responseSelector = this.adapter.getResponseContainerSelector()
-    let root: ParentNode | Element | null = this.adapter.getScrollContainer()
-
-    if (!root && responseSelector) {
-      try {
-        root = document.querySelector(responseSelector)
-      } catch {
-        root = null
-      }
-    }
-
-    const element = root instanceof Element ? root : document.body
-    const text = element.textContent || ""
-    return `${text.length}:${text.slice(Math.max(0, text.length - 400))}`
+  private getConversationKey(): string {
+    return `${window.location.origin}${window.location.pathname}`
   }
 
-  private async waitForConversationIdleAfterSubmit(): Promise<void> {
-    const startedAt = Date.now()
-    let lastActivityAt = startedAt
-    let lastSignature = this.getConversationActivitySignature()
-    let sawGenerating = this.adapter.isGenerating()
+  private getConversationObservationRoot(): Node {
+    const scrollContainer = this.adapter.getScrollContainer()
+    if (scrollContainer instanceof Node) return scrollContainer
 
-    while (Date.now() - startedAt < this.POST_SUBMIT_MAX_WAIT_MS) {
-      await new Promise((resolve) => setTimeout(resolve, 500))
-
-      const now = Date.now()
-      const isGenerating = this.adapter.isGenerating()
-      if (isGenerating) {
-        sawGenerating = true
-        lastActivityAt = now
-      }
-
-      const signature = this.getConversationActivitySignature()
-      if (signature !== lastSignature) {
-        lastSignature = signature
-        lastActivityAt = now
-      }
-
-      const waited = now - startedAt
-      const quietFor = now - lastActivityAt
-      const generationWasObservable = sawGenerating || waited >= this.GENERATION_START_GRACE_MS
-
-      if (
-        waited >= this.POST_SUBMIT_MIN_WAIT_MS &&
-        quietFor >= this.POST_SUBMIT_QUIET_MS &&
-        !isGenerating &&
-        generationWasObservable
-      ) {
-        return
+    const responseSelector = this.adapter.getResponseContainerSelector()
+    if (responseSelector) {
+      try {
+        const responseRoot = document.querySelector(responseSelector)
+        if (responseRoot) return responseRoot
+      } catch {
+        // 选择器无效时退回页面主体。
       }
     }
+
+    return document.body || document.documentElement
+  }
+
+  private hasRelevantConversationMutation(records: MutationRecord[]): boolean {
+    const isInsideOphelPanel = (node: Node): boolean => {
+      const element = node instanceof Element ? node : node.parentElement
+      return Boolean(element?.closest(".gh-main-panel"))
+    }
+
+    return records.some((record) => {
+      if (isInsideOphelPanel(record.target)) return false
+      if (record.type !== "childList") return true
+
+      const changedNodes = [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)]
+      return changedNodes.length === 0 || changedNodes.some((node) => !isInsideOphelPanel(node))
+    })
+  }
+
+  private waitForConversationIdleAfterSubmit(): Promise<void> {
+    return new Promise((resolve) => {
+      const startedAt = Date.now()
+      const conversationKey = this.getConversationKey()
+      let lastActivityAt = startedAt
+      let readiness = getQueueDispatchReadiness(this.adapter)
+      let sawBusyState = !readiness.canAcceptQueueItem
+      let done = false
+      let evaluationQueued = false
+      let settleTimerId: number | null = null
+      let graceTimerId: number | null = null
+      let fallbackTimerId: number | null = null
+      let maxWaitTimerId: number | null = null
+      let observer: MutationObserver | null = null
+
+      const clearSettleTimer = (): void => {
+        if (settleTimerId === null) return
+        window.clearTimeout(settleTimerId)
+        settleTimerId = null
+      }
+
+      const cleanup = (): void => {
+        clearSettleTimer()
+        if (graceTimerId !== null) window.clearTimeout(graceTimerId)
+        if (fallbackTimerId !== null) window.clearInterval(fallbackTimerId)
+        if (maxWaitTimerId !== null) window.clearTimeout(maxWaitTimerId)
+        observer?.disconnect()
+        window.removeEventListener("message", onMonitorMessage)
+        document.removeEventListener("visibilitychange", onPassiveSignal)
+        window.removeEventListener("focus", onPassiveSignal)
+        window.removeEventListener("popstate", onPassiveSignal)
+        window.removeEventListener("hashchange", onPassiveSignal)
+      }
+
+      const finish = (): void => {
+        if (done) return
+        done = true
+        cleanup()
+        resolve()
+      }
+
+      const evaluate = (activityObserved = false): void => {
+        if (done) return
+
+        if (this.getConversationKey() !== conversationKey) {
+          console.warn("[QueueDispatcher] 对话已切换，暂停队列以避免发送到错误会话")
+          useQueueStore.getState().pause()
+          finish()
+          return
+        }
+
+        const now = Date.now()
+        if (activityObserved) lastActivityAt = now
+
+        readiness = getQueueDispatchReadiness(this.adapter)
+        if (!readiness.canAcceptQueueItem) {
+          sawBusyState = true
+          lastActivityAt = now
+          clearSettleTimer()
+          return
+        }
+
+        const waited = now - startedAt
+        const activityWasObservable = sawBusyState || waited >= this.GENERATION_START_GRACE_MS
+        if (waited < this.POST_SUBMIT_MIN_WAIT_MS || !activityWasObservable) {
+          clearSettleTimer()
+          return
+        }
+
+        const remainingQuietMs = Math.max(0, this.POST_SUBMIT_QUIET_MS - (now - lastActivityAt))
+        if (settleTimerId !== null) return
+
+        settleTimerId = window.setTimeout(() => {
+          settleTimerId = null
+          if (done) return
+
+          const settledReadiness = getQueueDispatchReadiness(this.adapter)
+          if (settledReadiness.canAcceptQueueItem) {
+            finish()
+          } else {
+            sawBusyState = true
+            lastActivityAt = Date.now()
+          }
+        }, remainingQuietMs)
+      }
+
+      const scheduleEvaluation = (activityObserved = false): void => {
+        if (done) return
+        if (activityObserved) {
+          lastActivityAt = Date.now()
+          clearSettleTimer()
+        }
+        if (evaluationQueued) return
+
+        evaluationQueued = true
+        queueMicrotask(() => {
+          evaluationQueued = false
+          evaluate(activityObserved)
+        })
+      }
+
+      const onPassiveSignal = (): void => scheduleEvaluation(false)
+
+      const onMonitorMessage = (event: MessageEvent): void => {
+        if (event.origin !== window.location.origin) return
+        const type = event.data?.type
+        if (type !== EVENT_MONITOR_START && type !== EVENT_MONITOR_COMPLETE) return
+        scheduleEvaluation(true)
+      }
+
+      const observationRoot = this.getConversationObservationRoot()
+      if (typeof MutationObserver !== "undefined") {
+        observer = new MutationObserver((records) => {
+          if (this.hasRelevantConversationMutation(records)) {
+            scheduleEvaluation(true)
+          }
+        })
+        observer.observe(observationRoot, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: ["aria-disabled", "disabled", "data-disabled", "data-testid"],
+        })
+      }
+
+      window.addEventListener("message", onMonitorMessage)
+      document.addEventListener("visibilitychange", onPassiveSignal)
+      window.addEventListener("focus", onPassiveSignal)
+      window.addEventListener("popstate", onPassiveSignal)
+      window.addEventListener("hashchange", onPassiveSignal)
+
+      graceTimerId = window.setTimeout(
+        () => scheduleEvaluation(false),
+        this.GENERATION_START_GRACE_MS,
+      )
+      fallbackTimerId = window.setInterval(
+        () => scheduleEvaluation(false),
+        this.POST_SUBMIT_FALLBACK_CHECK_MS,
+      )
+      maxWaitTimerId = window.setTimeout(() => {
+        console.warn("[QueueDispatcher] 等待回复结束超时，释放队列调度锁")
+        finish()
+      }, this.POST_SUBMIT_MAX_WAIT_MS)
+
+      this.postSubmitWaitCancel = finish
+      scheduleEvaluation(false)
+    })
   }
 
   private startPostSubmitWait(): void {
     if (this.postSubmitWaitPromise) return
 
+    this.pollingTasks.stop(this.POLL_TASK_NAME)
     this.postSubmitWaitPromise = this.waitForConversationIdleAfterSubmit()
       .catch((error) => {
         console.error("[QueueDispatcher] 等待回复结束失败:", error)
       })
       .finally(() => {
         this.postSubmitWaitPromise = null
+        this.postSubmitWaitCancel = null
         this.idleCount = 0
+        this.syncPollingWithQueueState()
       })
   }
 
@@ -381,7 +559,7 @@ export class QueueDispatcher {
     if (state.isPaused) return false
     if (this.isDispatching) return false
     if (this.postSubmitWaitPromise) return false
-    if (this.adapter.isGenerating()) return false
+    if (!this.canAcceptQueueItem()) return false
     if (this.promptManager.hasEditorContent()) return false
 
     const hasSending = state.items.some((item) => item.status === "sending")

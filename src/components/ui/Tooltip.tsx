@@ -376,6 +376,22 @@ export const Tooltip: React.FC<TooltipProps> = ({
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isHoveringRef = useRef(false)
 
+  // QueueOverlay 的折叠胶囊使用 fixed 定位。若再由普通 inline-flex 包装，
+  // 包装盒会参与 .gh-root 的 flex/scroll overflow 计算，导致宿主页出现额外滚动条。
+  // 对该触发器移除包装盒，同时仍以真实胶囊节点计算 tooltip 位置。
+  const useContentsTrigger =
+    React.isValidElement<{ className?: string }>(children) &&
+    typeof children.props.className === "string" &&
+    children.props.className.split(/\s+/).includes("gh-queue-capsule")
+
+  const getTriggerElement = useCallback((): HTMLElement | null => {
+    const trigger = triggerRef.current
+    if (!trigger || !useContentsTrigger) return trigger
+
+    const child = trigger.firstElementChild
+    return child instanceof HTMLElement ? child : trigger
+  }, [useContentsTrigger])
+
   const hideTooltip = useCallback(() => {
     isHoveringRef.current = false
     if (timerRef.current) {
@@ -413,22 +429,23 @@ export const Tooltip: React.FC<TooltipProps> = ({
   }, [showTooltip])
 
   const updatePosition = useCallback(() => {
-    const triggerRect = triggerRef.current?.getBoundingClientRect()
+    const triggerRect = getTriggerElement()?.getBoundingClientRect()
     const tooltipRect = tooltipRef.current?.getBoundingClientRect()
     if (!triggerRect || !tooltipRect) return
 
     setPosition(
       calculateTooltipPosition(triggerRect, tooltipRect, { preferredPlacement: "bottom" }),
     )
-  }, [])
+  }, [getTriggerElement])
 
   useEffect(() => {
-    if (triggerRef.current) {
-      const container = resolveTooltipPortalContainer(triggerRef.current)
+    const triggerElement = getTriggerElement()
+    if (triggerElement) {
+      const container = resolveTooltipPortalContainer(triggerElement)
       setPortalContainer(container)
       ensureGlobalTooltipStyles(container)
     }
-  }, [])
+  }, [getTriggerElement])
 
   useEffect(() => {
     if ((isVisible || isMeasuring) && triggerRef.current) {
@@ -499,7 +516,7 @@ export const Tooltip: React.FC<TooltipProps> = ({
     }
   }, [delay, disabled, hideTooltip])
 
-  return (
+  const triggerNode = (
     <div
       ref={triggerRef}
       className={`ophel-tooltip-trigger ${className} ${triggerClassName}`}
@@ -507,7 +524,11 @@ export const Tooltip: React.FC<TooltipProps> = ({
       onMouseLeave={hideTooltip}
       onFocus={showTooltipFromFocus}
       onBlur={hideTooltip}
-      style={{ display: "inline-flex", ...triggerStyle }}>
+      style={
+        useContentsTrigger
+          ? { ...triggerStyle, display: "contents" }
+          : { display: "inline-flex", ...triggerStyle }
+      }>
       {children}
       {isVisible &&
         content &&
@@ -529,4 +550,6 @@ export const Tooltip: React.FC<TooltipProps> = ({
         )}
     </div>
   )
+
+  return triggerNode
 }
