@@ -1,4 +1,0 @@
-Temporary GitHub connector write test.
-Created on 2026-07-30 at approximately 03:24 China Standard Time.
-Purpose: verify Ophel keeps the ChatGPT tab in the in-progress state during an approval-gated GitHub write.
-This file is safe to delete after testing.
