@@ -54,7 +54,7 @@ const ACTIVE_ASSISTANT_RESPONSE_SELECTOR =
   '[data-turn="assistant"] [data-streaming-response-status]'
 const COMPLETION_ACTION_SELECTOR = '[data-testid="copy-turn-action-button"]'
 const TAB_COMPLETION_SETTLE_MS = 1600
-const TAB_COMPLETION_POLL_MS = 250
+const TAB_COMPLETION_MAX_WAIT_MS = 10 * 60 * 1000
 
 interface ApprovalTransitionLatch {
   conversationKey: string
@@ -64,8 +64,12 @@ interface ApprovalTransitionLatch {
 }
 
 interface PendingTabCompletion {
-  timerId: number
-  quietSince: number | null
+  conversationKey: string
+  observer: MutationObserver | null
+  settleTimerId: number | null
+  maxWaitTimerId: number
+  evaluationQueued: boolean
+  recheck: () => void
 }
 
 interface ChatGPTAdapterBridgePrototype {
@@ -74,6 +78,7 @@ interface ChatGPTAdapterBridgePrototype {
 }
 
 interface TabManagerBridgePrototype {
+  beginNetworkGeneration(this: TabManager, payload?: unknown): void
   onAiComplete(this: TabManager): void
   __ophelChatGPTCompletionBridgeInstalled__?: boolean
 }
@@ -99,14 +104,18 @@ function getConversationKey(): string {
   return `${window.location.origin}${window.location.pathname}`
 }
 
+function clearApprovalTransitionLatch(): void {
+  approvalTransitionLatch.active = false
+  approvalTransitionLatch.assistantTurnKey = null
+  approvalTransitionLatch.assistantTurnIndex = null
+}
+
 function syncApprovalTransitionConversation(): void {
   const conversationKey = getConversationKey()
   if (approvalTransitionLatch.conversationKey === conversationKey) return
 
   approvalTransitionLatch.conversationKey = conversationKey
-  approvalTransitionLatch.active = false
-  approvalTransitionLatch.assistantTurnKey = null
-  approvalTransitionLatch.assistantTurnIndex = null
+  clearApprovalTransitionLatch()
 }
 
 function isElementVisible(element: Element | null): element is HTMLElement {
@@ -189,10 +198,7 @@ function getLatestAssistantTurn(root: ParentNode): LatestAssistantTurnSignals {
 }
 
 function isTurnAtOrAfterApproval(latestTurn: LatestAssistantTurnSignals): boolean {
-  if (
-    approvalTransitionLatch.assistantTurnIndex !== null &&
-    latestTurn.index !== null
-  ) {
+  if (approvalTransitionLatch.assistantTurnIndex !== null && latestTurn.index !== null) {
     return latestTurn.index >= approvalTransitionLatch.assistantTurnIndex
   }
 
@@ -242,7 +248,126 @@ function installChatGPTTabCompletionBridge(): void {
   const prototype = TabManager.prototype as unknown as TabManagerBridgePrototype
   if (prototype.__ophelChatGPTCompletionBridgeInstalled__) return
 
+  const originalBeginNetworkGeneration = prototype.beginNetworkGeneration
   const originalOnAiComplete = prototype.onAiComplete
+
+  const clearSettleTimer = (pending: PendingTabCompletion): void => {
+    if (pending.settleTimerId === null) return
+    window.clearTimeout(pending.settleTimerId)
+    pending.settleTimerId = null
+  }
+
+  const cleanupPending = (manager: TabManager, pending: PendingTabCompletion): void => {
+    if (pendingTabCompletions.get(manager) !== pending) return
+
+    clearSettleTimer(pending)
+    window.clearTimeout(pending.maxWaitTimerId)
+    pending.observer?.disconnect()
+    document.removeEventListener("visibilitychange", pending.recheck)
+    window.removeEventListener("focus", pending.recheck)
+    window.removeEventListener("popstate", pending.recheck)
+    window.removeEventListener("hashchange", pending.recheck)
+    pendingTabCompletions.delete(manager)
+  }
+
+  const finishPending = (
+    manager: TabManager,
+    pending: PendingTabCompletion,
+    complete: boolean,
+  ): void => {
+    cleanupPending(manager, pending)
+    if (complete) originalOnAiComplete.call(manager)
+  }
+
+  const evaluatePending = (manager: TabManager, pending: PendingTabCompletion): void => {
+    if (pendingTabCompletions.get(manager) !== pending) return
+
+    if (getConversationKey() !== pending.conversationKey) {
+      finishPending(manager, pending, false)
+      return
+    }
+
+    const signals = getChatGPTComposerSignals()
+    if (!isChatGPTCompletionConfirmed(signals)) {
+      clearSettleTimer(pending)
+      return
+    }
+
+    if (pending.settleTimerId !== null) return
+
+    pending.settleTimerId = window.setTimeout(() => {
+      pending.settleTimerId = null
+      if (pendingTabCompletions.get(manager) !== pending) return
+
+      const settledSignals = getChatGPTComposerSignals()
+      if (isChatGPTCompletionConfirmed(settledSignals)) {
+        finishPending(manager, pending, true)
+      } else {
+        evaluatePending(manager, pending)
+      }
+    }, TAB_COMPLETION_SETTLE_MS)
+  }
+
+  const scheduleEvaluation = (manager: TabManager, pending: PendingTabCompletion): void => {
+    if (pendingTabCompletions.get(manager) !== pending || pending.evaluationQueued) return
+
+    pending.evaluationQueued = true
+    queueMicrotask(() => {
+      pending.evaluationQueued = false
+      evaluatePending(manager, pending)
+    })
+  }
+
+  const createPending = (manager: TabManager): PendingTabCompletion => {
+    const pending = {
+      conversationKey: getConversationKey(),
+      observer: null,
+      settleTimerId: null,
+      maxWaitTimerId: 0,
+      evaluationQueued: false,
+      recheck: () => undefined,
+    } satisfies PendingTabCompletion
+
+    pending.recheck = () => scheduleEvaluation(manager, pending)
+
+    if (typeof MutationObserver !== "undefined" && document.body) {
+      pending.observer = new MutationObserver(pending.recheck)
+      pending.observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["aria-disabled", "disabled", "data-disabled", "data-testid"],
+      })
+    }
+
+    document.addEventListener("visibilitychange", pending.recheck)
+    window.addEventListener("focus", pending.recheck)
+    window.addEventListener("popstate", pending.recheck)
+    window.addEventListener("hashchange", pending.recheck)
+
+    pending.maxWaitTimerId = window.setTimeout(() => {
+      if (pendingTabCompletions.get(manager) !== pending) return
+
+      console.warn("[TabManager] ChatGPT 完成确认等待超时，释放标签页状态")
+      clearApprovalTransitionLatch()
+      finishPending(manager, pending, true)
+    }, TAB_COMPLETION_MAX_WAIT_MS)
+
+    pendingTabCompletions.set(manager, pending)
+    return pending
+  }
+
+  prototype.beginNetworkGeneration = function beginNetworkGenerationWithCompletionReset(
+    this: TabManager,
+    payload?: unknown,
+  ): void {
+    const pending = pendingTabCompletions.get(this)
+    if (pending) clearSettleTimer(pending)
+
+    originalBeginNetworkGeneration.call(this, payload)
+
+    if (pending) scheduleEvaluation(this, pending)
+  }
 
   prototype.onAiComplete = function onAiCompleteAfterChatGPTSettles(this: TabManager): void {
     const adapter = getTabManagerAdapter(this)
@@ -251,32 +376,8 @@ function installChatGPTTabCompletionBridge(): void {
       return
     }
 
-    if (pendingTabCompletions.has(this)) return
-
-    const pending: PendingTabCompletion = {
-      timerId: 0,
-      quietSince: null,
-    }
-
-    const poll = () => {
-      const signals = getChatGPTComposerSignals()
-
-      if (!isChatGPTCompletionConfirmed(signals)) {
-        pending.quietSince = null
-      } else if (pending.quietSince === null) {
-        pending.quietSince = Date.now()
-      } else if (Date.now() - pending.quietSince >= TAB_COMPLETION_SETTLE_MS) {
-        pendingTabCompletions.delete(this)
-        originalOnAiComplete.call(this)
-        return
-      }
-
-      pending.timerId = window.setTimeout(poll, TAB_COMPLETION_POLL_MS)
-      pendingTabCompletions.set(this, pending)
-    }
-
-    pending.timerId = window.setTimeout(poll, TAB_COMPLETION_POLL_MS)
-    pendingTabCompletions.set(this, pending)
+    const pending = pendingTabCompletions.get(this) || createPending(this)
+    scheduleEvaluation(this, pending)
   }
 
   prototype.__ophelChatGPTCompletionBridgeInstalled__ = true
@@ -330,9 +431,7 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
     latestAssistantTurn.hasAssistantMessage &&
     isTurnAtOrAfterApproval(latestAssistantTurn)
   ) {
-    approvalTransitionLatch.active = false
-    approvalTransitionLatch.assistantTurnKey = null
-    approvalTransitionLatch.assistantTurnIndex = null
+    clearApprovalTransitionLatch()
   }
 
   let state: ChatGPTRunState = "unknown"
