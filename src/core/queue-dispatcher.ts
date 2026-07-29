@@ -14,6 +14,7 @@ import {
   stripQuickQuoteMarkers,
 } from "~core/quick-quote-marker"
 import { getQueueDispatchReadiness } from "~core/queue-dispatch-readiness"
+import { submitQueuePrompt } from "~core/queue-submit"
 import { useSettingsStore } from "~stores/settings-store"
 import type { QueueItem } from "~stores/queue-store"
 import { useQueueStore } from "~stores/queue-store"
@@ -172,8 +173,8 @@ export class QueueDispatcher {
       const submitShortcut =
         useSettingsStore.getState().settings.features?.prompts?.submitShortcut ?? "enter"
 
-      // 提交发送
-      const submitOk = await this.promptManager.submitPrompt(submitShortcut)
+      // 队列提交在 ChatGPT 上只允许点击明确可用的 send-button；其他站点保持原逻辑。
+      const submitOk = await submitQueuePrompt(this.adapter, this.promptManager, submitShortcut)
       if (!submitOk) {
         // 插入后确认超时分两类：内容仍在编辑器中才保留 sending 等待重试；
         // 编辑器已清空通常表示站点已接收，只是确认窗口太短。
@@ -265,7 +266,7 @@ export class QueueDispatcher {
         await this.promptManager.insertPrompt(editorContent)
       }
 
-      const submitOk = await this.promptManager.submitPrompt(submitShortcut)
+      const submitOk = await submitQueuePrompt(this.adapter, this.promptManager, submitShortcut)
 
       if (!submitOk) return
 
