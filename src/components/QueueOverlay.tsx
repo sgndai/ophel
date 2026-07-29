@@ -14,6 +14,7 @@ import { CleanupIcon, ImportIcon, PromptQueueIcon } from "~components/icons"
 import { DialogOverlay, Tooltip } from "~components/ui"
 import { extractVariables } from "~components/VariableInputDialog"
 import { formatShortcut, normalizeShortcutBinding } from "~constants/shortcuts"
+import { getQueueDispatchReadiness } from "~core/queue-dispatch-readiness"
 import type { QueueDispatcher } from "~core/queue-dispatcher"
 import { appendQuickQuoteMarker, stripQuickQuoteMarkers } from "~core/quick-quote-marker"
 import { usePromptsStore } from "~stores/prompts-store"
@@ -22,6 +23,11 @@ import type { QueueItem } from "~stores/queue-store"
 import { useQueueItems, useQueueStore } from "~stores/queue-store"
 import { attachEditableKeyboardFocusGuard } from "~utils/dom-toolkit"
 import { t } from "~utils/i18n"
+import {
+  EVENT_MONITOR_COMPLETE,
+  EVENT_MONITOR_START,
+  EVENT_PAGE_URL_CHANGE,
+} from "~utils/messaging"
 import { parseQueueBatchInput, splitQueueLines, type QueueBatchSplitMode } from "~utils/queue-batch"
 import { showToast } from "~utils/toast"
 
@@ -34,6 +40,9 @@ interface QueueOverlayProps {
 
 const BATCH_PREVIEW_LIMIT = 5
 const INPUT_CONTAINER_GAP_PX = 6
+const INPUT_DISCOVERY_RETRY_MS = 2000
+const INPUT_DISCOVERY_MAX_ATTEMPTS = 15
+const GENERATION_SETTLE_RECHECK_MS = 350
 type QueueBatchSource = "text" | "library"
 type QueueLibraryMode = "single" | "line"
 
@@ -194,59 +203,172 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
     })
   }, [adapter, findInputContainer])
 
-  // ResizeObserver 精准监听输入框位置/大小变化
+  // ResizeObserver 精准监听输入框位置/大小变化。输入框尚未挂载时只做有限次数发现，
+  // 找到后立即停止重试；路由切换或窗口重新激活时再按需重新发现。
   useEffect(() => {
-    updatePosition()
-
     let observer: ResizeObserver | null = null
     let targetEl: HTMLElement | null = null
+    let retryTimerId: number | null = null
+    let retryAttempts = 0
 
-    const initObserver = () => {
-      targetEl = adapter.getTextareaElement()
+    const clearRetryTimer = () => {
+      if (retryTimerId === null) return
+      window.clearTimeout(retryTimerId)
+      retryTimerId = null
+    }
 
-      if (targetEl) {
-        const inputContainer = findInputContainer(targetEl)
-        observer = new ResizeObserver(() => {
-          updatePosition()
-        })
-        observer.observe(targetEl)
-        observer.observe(inputContainer)
-        if (targetEl.parentElement) {
-          observer.observe(targetEl.parentElement) // 监听父级尺寸变化
-        }
+    const disconnectObserver = () => {
+      observer?.disconnect()
+      observer = null
+      targetEl = null
+    }
+
+    const initObserver = (): boolean => {
+      const nextTarget = adapter.getTextareaElement()
+      if (!nextTarget) {
+        setPosition(null)
+        return false
+      }
+
+      if (targetEl === nextTarget && observer && nextTarget.isConnected) {
+        updatePosition()
+        return true
+      }
+
+      disconnectObserver()
+      targetEl = nextTarget
+      const inputContainer = findInputContainer(nextTarget)
+      observer = new ResizeObserver(updatePosition)
+      observer.observe(nextTarget)
+      observer.observe(inputContainer)
+      if (nextTarget.parentElement) {
+        observer.observe(nextTarget.parentElement)
+      }
+      updatePosition()
+      return true
+    }
+
+    const scheduleDiscovery = () => {
+      if (retryTimerId !== null || retryAttempts >= INPUT_DISCOVERY_MAX_ATTEMPTS) return
+
+      retryTimerId = window.setTimeout(() => {
+        retryTimerId = null
+        retryAttempts += 1
+        if (!initObserver()) scheduleDiscovery()
+      }, INPUT_DISCOVERY_RETRY_MS)
+    }
+
+    const refreshTarget = () => {
+      if (targetEl?.isConnected && observer) {
+        updatePosition()
+        return
+      }
+
+      retryAttempts = 0
+      if (initObserver()) {
+        clearRetryTimer()
+      } else {
+        scheduleDiscovery()
       }
     }
 
-    // 初次尝试初始化
-    initObserver()
+    const resetTarget = () => {
+      clearRetryTimer()
+      disconnectObserver()
+      refreshTarget()
+    }
 
-    // 兜底轮询（防止页面动态加载输入框）
-    const intervalId = setInterval(() => {
-      updatePosition()
-      if (!observer && !targetEl) {
-        initObserver()
-      }
-    }, 2000)
+    const handlePageMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return
+      if (event.data?.type !== EVENT_PAGE_URL_CHANGE) return
+      resetTarget()
+    }
 
+    refreshTarget()
     window.addEventListener("resize", updatePosition)
+    window.addEventListener("focus", refreshTarget)
+    document.addEventListener("visibilitychange", refreshTarget)
+    window.addEventListener("popstate", resetTarget)
+    window.addEventListener("hashchange", resetTarget)
+    window.addEventListener("message", handlePageMessage)
 
     return () => {
-      clearInterval(intervalId)
+      clearRetryTimer()
+      disconnectObserver()
       window.removeEventListener("resize", updatePosition)
-      if (observer) {
-        observer.disconnect()
-      }
+      window.removeEventListener("focus", refreshTarget)
+      document.removeEventListener("visibilitychange", refreshTarget)
+      window.removeEventListener("popstate", resetTarget)
+      window.removeEventListener("hashchange", resetTarget)
+      window.removeEventListener("message", handlePageMessage)
     }
-  }, [updatePosition, adapter, findInputContainer])
+  }, [adapter, findInputContainer, updatePosition])
 
   // ==================== 生成状态监控 ====================
 
-  useEffect(() => {
-    const intervalId = setInterval(() => {
-      setIsGenerating(adapter.isGenerating())
-    }, 1000)
-    return () => clearInterval(intervalId)
+  const refreshGenerationState = useCallback(() => {
+    setIsGenerating(!getQueueDispatchReadiness(adapter).canAcceptQueueItem)
   }, [adapter])
+
+  useEffect(() => {
+    let settleTimerId: number | null = null
+
+    const clearSettleTimer = () => {
+      if (settleTimerId === null) return
+      window.clearTimeout(settleTimerId)
+      settleTimerId = null
+    }
+
+    const scheduleRefresh = (delay = 0) => {
+      clearSettleTimer()
+      settleTimerId = window.setTimeout(() => {
+        settleTimerId = null
+        refreshGenerationState()
+      }, delay)
+    }
+
+    const handleMonitorMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return
+
+      const type = event.data?.type
+      if (type === EVENT_MONITOR_START) {
+        clearSettleTimer()
+        setIsGenerating(true)
+        return
+      }
+
+      if (type === EVENT_MONITOR_COMPLETE) {
+        scheduleRefresh(GENERATION_SETTLE_RECHECK_MS)
+        return
+      }
+
+      if (type === EVENT_PAGE_URL_CHANGE) {
+        scheduleRefresh()
+      }
+    }
+
+    const handlePassiveRefresh = () => scheduleRefresh()
+
+    refreshGenerationState()
+    window.addEventListener("message", handleMonitorMessage)
+    document.addEventListener("visibilitychange", handlePassiveRefresh)
+    window.addEventListener("focus", handlePassiveRefresh)
+    window.addEventListener("popstate", handlePassiveRefresh)
+    window.addEventListener("hashchange", handlePassiveRefresh)
+
+    return () => {
+      clearSettleTimer()
+      window.removeEventListener("message", handleMonitorMessage)
+      document.removeEventListener("visibilitychange", handlePassiveRefresh)
+      window.removeEventListener("focus", handlePassiveRefresh)
+      window.removeEventListener("popstate", handlePassiveRefresh)
+      window.removeEventListener("hashchange", handlePassiveRefresh)
+    }
+  }, [refreshGenerationState])
+
+  useEffect(() => {
+    if (isExpanded) refreshGenerationState()
+  }, [isExpanded, refreshGenerationState])
 
   // ==================== 自定义快捷键 ====================
 
@@ -309,10 +431,13 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
     const content = inputValue.trim()
     if (!content) return
 
+    const readiness = getQueueDispatchReadiness(adapter)
+    const shouldQueue = store.isPaused || !readiness.canAcceptQueueItem
+    setIsGenerating(!readiness.canAcceptQueueItem)
     setInputValue("")
 
-    if (isGenerating) {
-      // AI 正在生成 -> 加入队列
+    if (shouldQueue) {
+      // AI 正在生成或队列已暂停 -> 加入队列
       store.enqueue(content)
       // 确保调度器在运行
       if (!dispatcher.isRunning()) {
@@ -324,7 +449,9 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
       // 可能只是确认超时（消息实际已发送），回退入队会导致重复发送
       await dispatcher.sendImmediately(content, submitShortcut)
     }
-  }, [inputValue, isGenerating, store, dispatcher, submitShortcut])
+
+    window.setTimeout(refreshGenerationState, GENERATION_SETTLE_RECHECK_MS)
+  }, [adapter, dispatcher, inputValue, refreshGenerationState, store, submitShortcut])
 
   // 队列输入框键盘事件处理（使用捕获阶段，避免被 Guard 拦截）
   useEffect(() => {
@@ -427,7 +554,7 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
       dispatcher.start()
     }
 
-    if (!adapter.isGenerating()) {
+    if (getQueueDispatchReadiness(adapter).canAcceptQueueItem) {
       await dispatcher.processNextNow()
     }
 
@@ -512,15 +639,18 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
   // 折叠态：胶囊
   if (!isExpanded) {
     return createPortal(
-      <Tooltip content={shortcutText || t("queueQuickAsk")}>
+      <Tooltip
+        content={store.isPaused ? "提示词队列已暂停，点击查看" : shortcutText || t("queueQuickAsk")}>
         <div className="gh-queue-capsule" style={capsuleStyle} onClick={() => setIsExpanded(true)}>
           <span className="gh-queue-capsule-icon">
             <PromptQueueIcon size={18} color="currentColor" />
           </span>
           <span>
-            {activeCount > 0
-              ? t("queueInQueue", { count: String(activeCount) })
-              : t("queueQuickAsk")}
+            {store.isPaused && activeCount > 0
+              ? `已暂停 · ${t("queueInQueue", { count: String(activeCount) })}`
+              : activeCount > 0
+                ? t("queueInQueue", { count: String(activeCount) })
+                : t("queueQuickAsk")}
           </span>
         </div>
       </Tooltip>,
@@ -732,10 +862,13 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
                 className="gh-queue-input"
                 value={inputValue}
                 onChange={handleInputChange}
+                onFocus={refreshGenerationState}
                 placeholder={
-                  isGenerating
-                    ? `AI 生成中，${submitKeyDisplay} 加入队列...`
-                    : `输入提示词，${submitKeyDisplay} 直接发送...`
+                  store.isPaused
+                    ? `队列已暂停，${submitKeyDisplay} 继续加入队列...`
+                    : isGenerating
+                      ? `AI 生成中，${submitKeyDisplay} 加入队列...`
+                      : `输入提示词，${submitKeyDisplay} 直接发送...`
                 }
                 rows={1}
               />
@@ -765,8 +898,40 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
             <span
               className="gh-queue-status-dot"
               data-generating={isGenerating ? "true" : "false"}
+              style={
+                store.isPaused
+                  ? { background: "var(--gh-danger, #ef4444)", animation: "none" }
+                  : undefined
+              }
             />
-            <span>{isGenerating ? t("queueStatusBusy") : t("queueStatusIdle")}</span>
+            <span>
+              {store.isPaused
+                ? "提示词队列已暂停"
+                : isGenerating
+                  ? t("queueStatusBusy")
+                  : t("queueStatusIdle")}
+            </span>
+            {store.isPaused && (
+              <button
+                type="button"
+                onClick={() => {
+                  store.resume()
+                  refreshGenerationState()
+                }}
+                style={{
+                  marginLeft: 4,
+                  padding: "1px 7px",
+                  border: "1px solid var(--gh-border, #d1d5db)",
+                  borderRadius: 6,
+                  background: "var(--gh-bg-secondary, #f9fafb)",
+                  color: "var(--gh-text-secondary, #6b7280)",
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                  fontSize: 10,
+                }}>
+                恢复
+              </button>
+            )}
             <span className="gh-queue-disable-hint" title={t("queueSettingDesc")}>
               ({t("queueDisableHint")})
             </span>
