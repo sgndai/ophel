@@ -1,4 +1,9 @@
-export type ChatGPTRunState = "generating" | "awaiting-approval" | "ready" | "unknown"
+export type ChatGPTRunState =
+  | "generating"
+  | "awaiting-approval"
+  | "tool-transition"
+  | "ready"
+  | "unknown"
 
 export interface ChatGPTComposerSignals {
   state: ChatGPTRunState
@@ -7,6 +12,8 @@ export interface ChatGPTComposerSignals {
   hasPendingApproval: boolean
   hasComposer: boolean
   hasIdleAction: boolean
+  hasLatestAssistantCompletionAction: boolean
+  approvalTransitionActive: boolean
 }
 
 const STOP_BUTTON_SELECTORS = [
@@ -35,6 +42,35 @@ const COMPOSER_SELECTORS = [
 
 const APPROVAL_CARD_SELECTOR = '[data-testid="tool-approval-card"]'
 const APPROVAL_ACTIONS_SELECTOR = '[data-testid="tool-action-buttons"]'
+const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]'
+const ASSISTANT_TURN_SELECTOR = '[data-turn="assistant"], [data-testid^="conversation-turn-"]'
+const COMPLETION_ACTION_SELECTOR = '[data-testid="copy-turn-action-button"]'
+
+interface ApprovalTransitionLatch {
+  conversationKey: string
+  active: boolean
+  assistantTurnKey: string | null
+}
+
+const approvalTransitionLatch: ApprovalTransitionLatch = {
+  conversationKey: "",
+  active: false,
+  assistantTurnKey: null,
+}
+
+function getConversationKey(): string {
+  if (typeof window === "undefined") return "document"
+  return `${window.location.origin}${window.location.pathname}`
+}
+
+function syncApprovalTransitionConversation(): void {
+  const conversationKey = getConversationKey()
+  if (approvalTransitionLatch.conversationKey === conversationKey) return
+
+  approvalTransitionLatch.conversationKey = conversationKey
+  approvalTransitionLatch.active = false
+  approvalTransitionLatch.assistantTurnKey = null
+}
 
 function isElementVisible(element: Element | null): element is HTMLElement {
   if (!(element instanceof HTMLElement) || !element.isConnected) return false
@@ -72,6 +108,31 @@ function isButtonEnabled(button: HTMLButtonElement): boolean {
   )
 }
 
+function getLatestAssistantTurn(root: ParentNode): {
+  key: string | null
+  hasCompletionAction: boolean
+} {
+  const assistantMessages = root.querySelectorAll(ASSISTANT_MESSAGE_SELECTOR)
+  const latestMessage = assistantMessages[assistantMessages.length - 1]
+  if (!(latestMessage instanceof HTMLElement)) {
+    return { key: null, hasCompletionAction: false }
+  }
+
+  const turn = latestMessage.closest(ASSISTANT_TURN_SELECTOR) || latestMessage
+  const key =
+    turn.getAttribute("data-turn-id") ||
+    turn.getAttribute("data-turn-id-container") ||
+    turn.getAttribute("data-testid") ||
+    latestMessage.getAttribute("data-message-id")
+  const completionAction = turn.querySelector(COMPLETION_ACTION_SELECTOR)
+  const hasCompletionAction =
+    completionAction instanceof HTMLButtonElement &&
+    completionAction.isConnected &&
+    isButtonEnabled(completionAction)
+
+  return { key, hasCompletionAction }
+}
+
 export function hasPendingChatGPTToolApproval(root: ParentNode = document): boolean {
   const cards = root.querySelectorAll(APPROVAL_CARD_SELECTOR)
 
@@ -98,11 +159,28 @@ export function findVisibleChatGPTSendButton(root: ParentNode = document): HTMLB
 }
 
 export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTComposerSignals {
+  syncApprovalTransitionConversation()
+
   const hasPendingApproval = hasPendingChatGPTToolApproval(root)
   const hasStopButton = findVisibleElement(root, STOP_BUTTON_SELECTORS) !== null
   const hasSendButton = findVisibleChatGPTSendButton(root) !== null
   const hasComposer = findVisibleElement(root, COMPOSER_SELECTORS) !== null
   const hasIdleAction = findVisibleElement(root, IDLE_ACTION_SELECTORS) !== null
+  const latestAssistantTurn = getLatestAssistantTurn(root)
+
+  if (hasPendingApproval) {
+    approvalTransitionLatch.active = true
+    approvalTransitionLatch.assistantTurnKey = latestAssistantTurn.key
+  } else if (
+    approvalTransitionLatch.active &&
+    latestAssistantTurn.hasCompletionAction &&
+    (!approvalTransitionLatch.assistantTurnKey ||
+      !latestAssistantTurn.key ||
+      latestAssistantTurn.key === approvalTransitionLatch.assistantTurnKey)
+  ) {
+    approvalTransitionLatch.active = false
+    approvalTransitionLatch.assistantTurnKey = null
+  }
 
   let state: ChatGPTRunState = "unknown"
 
@@ -110,6 +188,10 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
     state = "awaiting-approval"
   } else if (hasStopButton) {
     state = "generating"
+  } else if (approvalTransitionLatch.active) {
+    // 审批卡消失不等于工具调用完成。等待同一条 AI 回复出现复制操作，
+    // 以此确认该回复已经真正收尾，再允许队列继续消费。
+    state = "tool-transition"
   } else if (hasComposer && hasIdleAction) {
     // ChatGPT 空输入时通常显示语音按钮；队列内容插入后才切换为 send-button。
     // 因此这里表示“可接收队列内容”，实际提交仍需再次确认 send-button。
@@ -123,6 +205,8 @@ export function getChatGPTComposerSignals(root: ParentNode = document): ChatGPTC
     hasPendingApproval,
     hasComposer,
     hasIdleAction,
+    hasLatestAssistantCompletionAction: latestAssistantTurn.hasCompletionAction,
+    approvalTransitionActive: approvalTransitionLatch.active,
   }
 }
 
