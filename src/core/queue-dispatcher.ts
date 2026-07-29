@@ -2,7 +2,7 @@
  * Queue Dispatcher - 队列调度引擎
  *
  * 负责在 AI 空闲时自动从队列中取出提示词并发送。
- * 使用防抖机制：连续 2 秒检测到 isGenerating() === false 才触发发送。
+ * 使用防抖机制：连续 2 秒检测到队列可调度状态才触发发送。
  */
 
 import type { SiteAdapter } from "~adapters/base"
@@ -13,6 +13,7 @@ import {
   rememberQuickQuoteReferenceForContent,
   stripQuickQuoteMarkers,
 } from "~core/quick-quote-marker"
+import { getQueueDispatchReadiness } from "~core/queue-dispatch-readiness"
 import { useSettingsStore } from "~stores/settings-store"
 import type { QueueItem } from "~stores/queue-store"
 import { useQueueStore } from "~stores/queue-store"
@@ -66,6 +67,10 @@ export class QueueDispatcher {
     return this.pollingTasks.isRunning(this.POLL_TASK_NAME)
   }
 
+  private canAcceptQueueItem(): boolean {
+    return getQueueDispatchReadiness(this.adapter).canAcceptQueueItem
+  }
+
   /**
    * 每秒执行的轮询逻辑
    */
@@ -100,11 +105,9 @@ export class QueueDispatcher {
       return
     }
 
-    // 检测 AI 是否正在生成
-    const isGenerating = this.adapter.isGenerating()
-
-    if (isGenerating) {
-      // AI 正在生成，重置空闲计数
+    // ChatGPT 只有在 composer 明确可接收新提示词时才允许调度。
+    // 其他站点继续沿用 adapter.isGenerating() 的兼容判断。
+    if (!this.canAcceptQueueItem()) {
       this.idleCount = 0
       return
     }
@@ -131,10 +134,9 @@ export class QueueDispatcher {
 
     this.isDispatching = true
     try {
-      // 二次确认：插入前再次检查 AI 是否真的空闲
-      // 防止从 tick() 到这里的时间差内 AI 开始生成
-      if (this.adapter.isGenerating()) {
-        // AI 已经在生成了，把项目放回队列
+      // 二次确认：插入前再次检查页面是否仍可接收队列项目，
+      // 防止从 tick() 到这里的时间差内进入生成、审批或未知状态。
+      if (!this.canAcceptQueueItem()) {
         store.updateStatus(item.id, "pending")
         this.idleCount = 0
         return
@@ -227,7 +229,7 @@ export class QueueDispatcher {
   }
 
   private async recoverSendingItem(item: QueueItem): Promise<void> {
-    if (this.adapter.isGenerating()) {
+    if (!this.canAcceptQueueItem()) {
       this.idleCount = 0
       return
     }
@@ -381,7 +383,7 @@ export class QueueDispatcher {
     if (state.isPaused) return false
     if (this.isDispatching) return false
     if (this.postSubmitWaitPromise) return false
-    if (this.adapter.isGenerating()) return false
+    if (!this.canAcceptQueueItem()) return false
     if (this.promptManager.hasEditorContent()) return false
 
     const hasSending = state.items.some((item) => item.status === "sending")
