@@ -24,6 +24,7 @@ export class QueueDispatcher {
   private adapter: SiteAdapter
   private promptManager: PromptManager
   private readonly pollingTasks = new PollingTaskRegistry()
+  private queueStoreUnsubscribe: (() => void) | null = null
   private idleCount = 0 // 连续空闲计数
   private isDispatching = false
   private postSubmitWaitPromise: Promise<void> | null = null
@@ -43,11 +44,48 @@ export class QueueDispatcher {
   }
 
   /**
-   * 启动调度循环
+   * 启动调度器。常驻部分仅订阅队列状态；实际轮询仅在队列有待处理项目时存在。
    */
   start(): void {
-    if (this.isRunning()) return // 已在运行
+    if (this.isRunning()) return
+
     this.idleCount = 0
+    this.queueStoreUnsubscribe = useQueueStore.subscribe(() => {
+      this.syncPollingWithQueueState()
+    })
+    this.syncPollingWithQueueState()
+  }
+
+  /**
+   * 停止调度器并清理全部临时任务。
+   */
+  stop(): void {
+    this.queueStoreUnsubscribe?.()
+    this.queueStoreUnsubscribe = null
+    this.pollingTasks.stop(this.POLL_TASK_NAME)
+    this.postSubmitWaitCancel?.()
+    this.idleCount = 0
+  }
+
+  /**
+   * 判断调度器是否已启用。队列为空时轮询会停止，但调度器仍保持队列订阅。
+   */
+  isRunning(): boolean {
+    return this.queueStoreUnsubscribe !== null
+  }
+
+  private hasRunnableQueueWork(): boolean {
+    const state = useQueueStore.getState()
+    if (state.isPaused) return false
+
+    return state.items.some((item) => item.status === "pending" || item.status === "sending")
+  }
+
+  private startPollingLoop(): void {
+    if (!this.isRunning()) return
+    if (this.postSubmitWaitPromise) return
+    if (this.pollingTasks.isRunning(this.POLL_TASK_NAME)) return
+
     this.pollingTasks.start({
       name: this.POLL_TASK_NAME,
       intervalMs: this.POLL_INTERVAL,
@@ -56,20 +94,16 @@ export class QueueDispatcher {
     })
   }
 
-  /**
-   * 停止调度循环
-   */
-  stop(): void {
-    this.pollingTasks.stop(this.POLL_TASK_NAME)
-    this.postSubmitWaitCancel?.()
-    this.idleCount = 0
-  }
+  private syncPollingWithQueueState(): void {
+    if (!this.isRunning()) return
 
-  /**
-   * 检查是否正在运行
-   */
-  isRunning(): boolean {
-    return this.pollingTasks.isRunning(this.POLL_TASK_NAME)
+    if (!this.hasRunnableQueueWork() || this.postSubmitWaitPromise) {
+      this.pollingTasks.stop(this.POLL_TASK_NAME)
+      if (!this.hasRunnableQueueWork()) this.idleCount = 0
+      return
+    }
+
+    this.startPollingLoop()
   }
 
   private canAcceptQueueItem(): boolean {
@@ -77,7 +111,7 @@ export class QueueDispatcher {
   }
 
   /**
-   * 每秒执行的轮询逻辑
+   * 仅在队列中存在待处理项目时，每秒执行一次。
    */
   private async tick(): Promise<void> {
     if (this.isDispatching) return
@@ -87,6 +121,7 @@ export class QueueDispatcher {
 
     if (state.isPaused) {
       this.idleCount = 0
+      this.syncPollingWithQueueState()
       return
     }
 
@@ -97,10 +132,11 @@ export class QueueDispatcher {
       return
     }
 
-    // 如果队列为空，重置计数
+    // 如果队列为空，立即停止轮询。
     const pendingItems = state.items.filter((i) => i.status === "pending")
     if (pendingItems.length === 0) {
       this.idleCount = 0
+      this.syncPollingWithQueueState()
       return
     }
 
@@ -475,6 +511,7 @@ export class QueueDispatcher {
   private startPostSubmitWait(): void {
     if (this.postSubmitWaitPromise) return
 
+    this.pollingTasks.stop(this.POLL_TASK_NAME)
     this.postSubmitWaitPromise = this.waitForConversationIdleAfterSubmit()
       .catch((error) => {
         console.error("[QueueDispatcher] 等待回复结束失败:", error)
@@ -483,6 +520,7 @@ export class QueueDispatcher {
         this.postSubmitWaitPromise = null
         this.postSubmitWaitCancel = null
         this.idleCount = 0
+        this.syncPollingWithQueueState()
       })
   }
 
