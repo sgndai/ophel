@@ -403,7 +403,9 @@ export function hasPendingChatGPTToolApproval(root: ParentNode = document): bool
   return false
 }
 
-export function findVisibleChatGPTSendButton(root: ParentNode = document): HTMLButtonElement | null {
+export function findVisibleChatGPTSendButton(
+  root: ParentNode = document,
+): HTMLButtonElement | null {
   const button = findVisibleElement(root, SEND_BUTTON_SELECTORS)
   return button instanceof HTMLButtonElement && isButtonEnabled(button) ? button : null
 }

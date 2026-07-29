@@ -1,9 +1,6 @@
 import type { SiteAdapter } from "~adapters/base"
 import { SITE_IDS } from "~constants/defaults"
-import {
-  findVisibleChatGPTSendButton,
-  getChatGPTComposerSignals,
-} from "~core/chatgpt-run-state"
+import { findVisibleChatGPTSendButton, getChatGPTComposerSignals } from "~core/chatgpt-run-state"
 import type { PromptManager } from "~core/prompt-manager"
 
 const CHATGPT_SEND_BUTTON_WAIT_MS = 2000

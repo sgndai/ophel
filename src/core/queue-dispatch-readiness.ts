@@ -1,9 +1,6 @@
 import type { SiteAdapter } from "~adapters/base"
 import { SITE_IDS } from "~constants/defaults"
-import {
-  getChatGPTComposerSignals,
-  type ChatGPTRunState,
-} from "~core/chatgpt-run-state"
+import { getChatGPTComposerSignals, type ChatGPTRunState } from "~core/chatgpt-run-state"
 
 export type QueueDispatchReadinessState =
   | "ready"

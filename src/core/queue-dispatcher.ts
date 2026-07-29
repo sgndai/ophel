@@ -424,10 +424,7 @@ export class QueueDispatcher {
           return
         }
 
-        const remainingQuietMs = Math.max(
-          0,
-          this.POST_SUBMIT_QUIET_MS - (now - lastActivityAt),
-        )
+        const remainingQuietMs = Math.max(0, this.POST_SUBMIT_QUIET_MS - (now - lastActivityAt))
         if (settleTimerId !== null) return
 
         settleTimerId = window.setTimeout(() => {
