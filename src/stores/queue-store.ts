@@ -334,7 +334,8 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
   markCurrentComplete: () =>
     set((state) => {
       const completed = Math.max(state.run.completed, state.run.current)
-      const finished = state.run.total > 0 && completed >= state.run.total && !hasActiveItems(state.items)
+      const finished =
+        state.run.total > 0 && completed >= state.run.total && !hasActiveItems(state.items)
 
       return {
         isProcessing: !finished && hasActiveItems(state.items),
@@ -380,9 +381,7 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
 
   retryFailed: (itemId) =>
     set((state) => {
-      const failedItem = state.items.find(
-        (item) => item.id === itemId && item.status === "failed",
-      )
+      const failedItem = state.items.find((item) => item.id === itemId && item.status === "failed")
       if (!failedItem) return state
 
       return {
@@ -404,9 +403,7 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
 
   skipFailed: (itemId) =>
     set((state) => {
-      const failedItem = state.items.find(
-        (item) => item.id === itemId && item.status === "failed",
-      )
+      const failedItem = state.items.find((item) => item.id === itemId && item.status === "failed")
       if (!failedItem) return state
 
       const items = state.items.filter((item) => item.id !== itemId)
@@ -432,9 +429,7 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
 
   discardFailed: (itemId) =>
     set((state) => {
-      const failedItem = state.items.find(
-        (item) => item.id === itemId && item.status === "failed",
-      )
+      const failedItem = state.items.find((item) => item.id === itemId && item.status === "failed")
       if (!failedItem) return state
 
       const items = state.items
@@ -487,11 +482,7 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
       run: {
         ...state.run,
         phase:
-          state.run.phase === "failed"
-            ? "failed"
-            : state.run.activeItemId
-              ? "generating"
-              : "idle",
+          state.run.phase === "failed" ? "failed" : state.run.activeItemId ? "generating" : "idle",
       },
     })),
 }))

@@ -168,7 +168,9 @@ function positionRuntimeRoot(root: HTMLElement): void {
 
 function focusNativeEditor(): void {
   const candidates = Array.from(
-    document.querySelectorAll<HTMLElement>('textarea, input[type="text"], [contenteditable="true"]'),
+    document.querySelectorAll<HTMLElement>(
+      'textarea, input[type="text"], [contenteditable="true"]',
+    ),
   )
 
   const editor = candidates.find((element) => {
@@ -187,7 +189,8 @@ function focusNativeEditor(): void {
 }
 
 function handleRuntimeAction(event: MouseEvent): void {
-  const target = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button") : null
+  const target =
+    event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button") : null
   if (!target) return
 
   const action = target.dataset.action
@@ -240,7 +243,13 @@ function renderRuntimeUi(): void {
     : state.run.blockedReason === "editor-unknown"
       ? "输入框包含无法确认的内容"
       : "等待输入框清空"
-  const renderKey = [kind, progress, titleText, failedItem?.id || "", failedItem?.content || ""].join("|")
+  const renderKey = [
+    kind,
+    progress,
+    titleText,
+    failedItem?.id || "",
+    failedItem?.content || "",
+  ].join("|")
 
   if (lastRenderKey === renderKey) {
     root.style.display = "block"
@@ -322,8 +331,7 @@ function isRuntimeMutation(record: MutationRecord): boolean {
     changedNodes.every(
       (node) =>
         node === runtimeRoot ||
-        (node instanceof Element &&
-          (node.id === RUNTIME_ROOT_ID || node.id === RUNTIME_STYLE_ID)),
+        (node instanceof Element && (node.id === RUNTIME_ROOT_ID || node.id === RUNTIME_STYLE_ID)),
     )
   )
 }

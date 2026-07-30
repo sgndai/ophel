@@ -1,7 +1,4 @@
-import {
-  formatQueueAwareStatusPrefix,
-  MANAGED_STATUS_TOKEN_SOURCE,
-} from "~core/queue-title-status"
+import { formatQueueAwareStatusPrefix, MANAGED_STATUS_TOKEN_SOURCE } from "~core/queue-title-status"
 
 export const MANAGED_TAB_TITLE_ATTR = "data-ophel-managed-tab-title"
 export const STALE_MANAGED_TAB_TITLE_ATTR = "data-ophel-stale-managed-tab-title"
@@ -10,10 +7,7 @@ export const GEMINI_NATIVE_TAB_TITLE_PATH_ATTR = "data-ophel-gemini-native-tab-t
 const MAX_MANAGED_TITLE_STRIP_PASSES = 20
 const PLACEHOLDER_PATTERN = /\{(?:status|title|model|site)\}/g
 const MODEL_PLACEHOLDER = "{model}"
-const MANAGED_STATUS_PREFIX_PATTERN = new RegExp(
-  `^(?:${MANAGED_STATUS_TOKEN_SOURCE}\\s*)+`,
-  "u",
-)
+const MANAGED_STATUS_PREFIX_PATTERN = new RegExp(`^(?:${MANAGED_STATUS_TOKEN_SOURCE}\\s*)+`, "u")
 const WRAPPER_PAIRS: Record<string, string> = {
   "(": ")",
   "[": "]",

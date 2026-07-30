@@ -640,7 +640,9 @@ export const QueueOverlay: React.FC<QueueOverlayProps> = ({ adapter, dispatcher 
   if (!isExpanded) {
     return createPortal(
       <Tooltip
-        content={store.isPaused ? "提示词队列已暂停，点击查看" : shortcutText || t("queueQuickAsk")}>
+        content={
+          store.isPaused ? "提示词队列已暂停，点击查看" : shortcutText || t("queueQuickAsk")
+        }>
         <div className="gh-queue-capsule" style={capsuleStyle} onClick={() => setIsExpanded(true)}>
           <span className="gh-queue-capsule-icon">
             <PromptQueueIcon size={18} color="currentColor" />

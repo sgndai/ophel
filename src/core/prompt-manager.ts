@@ -160,9 +160,7 @@ export class PromptManager {
       if (occupancy.state === "empty") {
         queueStore.clearBlocked()
       } else {
-        queueStore.markBlocked(
-          occupancy.state === "unknown" ? "editor-unknown" : "editor-content",
-        )
+        queueStore.markBlocked(occupancy.state === "unknown" ? "editor-unknown" : "editor-content")
       }
     }
 
