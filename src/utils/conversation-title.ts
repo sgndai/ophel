@@ -1,3 +1,5 @@
+import { formatQueueAwareStatusPrefix, MANAGED_STATUS_TOKEN_SOURCE } from "~core/queue-title-status"
+
 export const MANAGED_TAB_TITLE_ATTR = "data-ophel-managed-tab-title"
 export const STALE_MANAGED_TAB_TITLE_ATTR = "data-ophel-stale-managed-tab-title"
 export const GEMINI_NATIVE_TAB_TITLE_ATTR = "data-ophel-gemini-native-tab-title"
@@ -5,6 +7,7 @@ export const GEMINI_NATIVE_TAB_TITLE_PATH_ATTR = "data-ophel-gemini-native-tab-t
 const MAX_MANAGED_TITLE_STRIP_PASSES = 20
 const PLACEHOLDER_PATTERN = /\{(?:status|title|model|site)\}/g
 const MODEL_PLACEHOLDER = "{model}"
+const MANAGED_STATUS_PREFIX_PATTERN = new RegExp(`^(?:${MANAGED_STATUS_TOKEN_SOURCE}\\s*)+`, "u")
 const WRAPPER_PAIRS: Record<string, string> = {
   "(": ")",
   "[": "]",
@@ -73,9 +76,10 @@ export function formatManagedTabTitle(format: string, parts: ManagedTabTitlePart
     ? `[${normalizeConversationTitle(parts.modelName)}]`
     : ""
   const normalizedFormat = modelToken ? format : removeEmptyModelPlaceholderSegment(format)
+  const statusToken = formatQueueAwareStatusPrefix(parts.statusPrefix)
 
   return normalizedFormat
-    .replace(/\{status\}/g, parts.statusPrefix)
+    .replace(/\{status\}/g, statusToken)
     .replace(/\{title\}/g, parts.conversationTitle)
     .replace(/\{model\}/g, modelToken)
     .replace(/\{site\}/g, parts.siteName)
@@ -249,8 +253,8 @@ function stripManagedTabTitleDecorations(
   let cleaned = title
   let hasManagedSignal = options.hasManagedSignal
 
-  if (hasManagedSignal && /^(?:[⏳✅]\s*)+/u.test(cleaned)) {
-    cleaned = cleaned.replace(/^(?:[⏳✅]\s*)+/u, "")
+  if (hasManagedSignal && MANAGED_STATUS_PREFIX_PATTERN.test(cleaned)) {
+    cleaned = cleaned.replace(MANAGED_STATUS_PREFIX_PATTERN, "")
   }
 
   const templateCleaned = stripManagedTitleFormatDecorations(cleaned, {
@@ -338,7 +342,7 @@ function createManagedTitleFormatRegex(
       source += titleSeen ? "[\\s\\S]*?" : "(?<ophelTitle>[\\s\\S]+?)"
       titleSeen = true
     } else if (placeholder === "status") {
-      source += `(?<ophelStatus${groupIndex}>(?:[⏳✅]\\s*)*)`
+      source += `(?<ophelStatus${groupIndex}>(?:(?:${MANAGED_STATUS_TOKEN_SOURCE})\\s*)*)`
       groupIndex += 1
     } else if (placeholder === "model") {
       source += `(?<ophelModel${groupIndex}>\\[[^\\]]{1,160}\\])?`
@@ -375,9 +379,13 @@ function parseManagedTitleByFormat(
     const parsedTitle = normalizeConversationTitle(match?.groups?.ophelTitle)
     if (!match || !parsedTitle) continue
 
+    const hasManagedSignal = Object.entries(match.groups || {}).some(
+      ([name, value]) => name.startsWith("ophelStatus") && Boolean(value),
+    )
+
     return {
       title: parsedTitle,
-      hasManagedSignal: false,
+      hasManagedSignal,
     }
   }
 
