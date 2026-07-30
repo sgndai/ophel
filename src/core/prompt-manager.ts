@@ -8,16 +8,22 @@
 import type { SiteAdapter } from "~adapters/base"
 import { VIRTUAL_CATEGORY } from "~constants"
 import { SITE_IDS } from "~constants/defaults"
+import {
+  getEditorOccupancy as inspectEditorOccupancy,
+  normalizeComparableEditorText,
+  type EditorOccupancy,
+} from "~core/editor-occupancy"
 import { rememberQuickQuoteReferencesFromContent } from "~core/quick-quote-marker"
-import { DOMToolkit } from "~utils/dom-toolkit"
 import {
   filterPrompts,
   getCategories,
   getPromptsStore,
   usePromptsStore,
 } from "~stores/prompts-store"
-import type { Prompt } from "~utils/storage"
+import { useQueueStore } from "~stores/queue-store"
 import { isLikelyMobileDevice } from "~utils/device"
+import { DOMToolkit } from "~utils/dom-toolkit"
+import type { Prompt } from "~utils/storage"
 
 export const AI_STUDIO_SHORTCUT_SYNC_EVENT = "ophel:aistudio-submit-shortcut-synced"
 
@@ -131,17 +137,36 @@ export class PromptManager {
     return editor.textContent || ""
   }
 
+  private getEditorElement(): HTMLElement | null {
+    return this.adapter.getTextareaElement() || this.adapter.findTextarea()
+  }
+
   getCurrentEditorContent(): string {
-    const editor = this.adapter.getTextareaElement() || this.adapter.findTextarea()
-    return this.getEditorContent(editor)
+    return this.getEditorContent(this.getEditorElement())
+  }
+
+  getCurrentEditorOccupancy(): EditorOccupancy {
+    return inspectEditorOccupancy(this.getEditorElement())
   }
 
   hasEditorContent(): boolean {
-    return (
-      this.getCurrentEditorContent()
-        .replace(/[\u200B\u200C\u200D\uFEFF]/g, "")
-        .trim().length > 0
+    const occupancy = this.getCurrentEditorOccupancy()
+    const queueStore = useQueueStore.getState()
+    const hasQueuedWork = queueStore.items.some(
+      (item) => item.status === "pending" || item.status === "sending",
     )
+
+    if (hasQueuedWork) {
+      if (occupancy.state === "empty") {
+        queueStore.clearBlocked()
+      } else {
+        queueStore.markBlocked(
+          occupancy.state === "unknown" ? "editor-unknown" : "editor-content",
+        )
+      }
+    }
+
+    return occupancy.state !== "empty"
   }
 
   private isElementDisabled(element: HTMLElement | null): boolean {
@@ -316,18 +341,19 @@ export class PromptManager {
     buttonState: { button: HTMLElement | null; clicked: boolean; wasDisabled: boolean },
   ): Promise<boolean> {
     const deadline = Date.now() + 1500
-    const hadContent = initialContent.trim().length > 0
+    const normalizedInitial = normalizeComparableEditorText(initialContent)
+    const hadContent = normalizedInitial.length > 0
 
     while (Date.now() < deadline) {
-      const currentEditor = this.adapter.getTextareaElement() || this.adapter.findTextarea()
-      const currentContent = this.getEditorContent(currentEditor)
+      const currentEditor = this.getEditorElement()
+      const currentContent = normalizeComparableEditorText(this.getEditorContent(currentEditor))
 
-      if (hadContent && currentContent.trim().length === 0) {
+      if (hadContent && currentContent.length === 0) {
         return true
       }
 
       // 初始内容不再存在于编辑器中（可能被占位文字替换，如 Gemini Enterprise 的"接着提问"）
-      if (hadContent && !currentContent.includes(initialContent.trim())) {
+      if (hadContent && !currentContent.includes(normalizedInitial)) {
         return true
       }
 
@@ -395,7 +421,7 @@ export class PromptManager {
     this.syncAiStudioSubmitShortcut(submitShortcut ?? "enter")
 
     const submitSelectors = this.adapter.getSubmitButtonSelectors()
-    const editor = this.adapter.getTextareaElement() || this.adapter.findTextarea()
+    const editor = this.getEditorElement()
     const submitButton = this.findBestSubmitButton(submitSelectors, editor)
 
     if (submitButton && !this.isElementDisabled(submitButton)) {
@@ -403,9 +429,7 @@ export class PromptManager {
       return true
     }
 
-    const currentContent = this.getEditorContent(editor)
-      .replace(/[\u200B\u200C\u200D\uFEFF]/g, "")
-      .trim()
+    const currentContent = normalizeComparableEditorText(this.getEditorContent(editor))
     if (!editor || !currentContent) return false
 
     return this.dispatchNativeSubmitByKeyboard(editor)
@@ -416,13 +440,11 @@ export class PromptManager {
       return false
     }
 
-    const editor = this.adapter.getTextareaElement() || this.adapter.findTextarea()
+    const editor = this.getEditorElement()
     if (!editor) return false
 
-    const currentContent = this.getEditorContent(editor)
-      .replace(/[\u200B\u200C\u200D\uFEFF]/g, "")
-      .trim()
-    const normalizedInitial = initialContent.replace(/[\u200B\u200C\u200D\uFEFF]/g, "").trim()
+    const currentContent = normalizeComparableEditorText(this.getEditorContent(editor))
+    const normalizedInitial = normalizeComparableEditorText(initialContent)
 
     if (!currentContent) return false
     if (!normalizedInitial) return false
@@ -437,12 +459,12 @@ export class PromptManager {
   async submitPrompt(submitShortcut?: "enter" | "ctrlEnter"): Promise<boolean> {
     this.syncAiStudioSubmitShortcut(submitShortcut ?? "enter")
     const submitSelectors = this.adapter.getSubmitButtonSelectors()
-    const editor = this.adapter.getTextareaElement() || this.adapter.findTextarea()
+    const editor = this.getEditorElement()
     const initialContent = this.getEditorContent(editor)
 
     // 安全检查：如果编辑器为空，后面只允许点击已启用的真实发送按钮。
     // 这保留纯空输入保护，同时放行图片/附件-only 发送。
-    const trimmedContent = initialContent.replace(/[\u200B\u200C\u200D\uFEFF]/g, "").trim()
+    const normalizedContent = normalizeComparableEditorText(initialContent)
 
     let triggered = false
     let clickedButton: HTMLElement | null = null
@@ -477,10 +499,9 @@ export class PromptManager {
     }
 
     if (!triggered) {
-      if (!trimmedContent) return false
+      if (!normalizedContent) return false
 
-      const activeEditor =
-        editor || this.adapter.getTextareaElement() || this.adapter.findTextarea()
+      const activeEditor = editor || this.getEditorElement()
       if (!activeEditor) return false
 
       triggered = this.dispatchNativeSubmitByKeyboard(activeEditor)
@@ -502,7 +523,7 @@ export class PromptManager {
       return false
     }
 
-    const retryEditor = this.adapter.getTextareaElement() || this.adapter.findTextarea()
+    const retryEditor = this.getEditorElement()
     if (!retryEditor) {
       return false
     }
