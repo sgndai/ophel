@@ -1,3 +1,4 @@
+import { ensureQueueRuntimeUi } from "~core/queue-runtime-ui"
 import { useQueueStore } from "~stores/queue-store"
 
 export const MANAGED_STATUS_TOKEN_SOURCE = "(?:⏳|✅)(?:\\d{1,4}\\/\\d{1,4})?"
@@ -11,6 +12,8 @@ let latestRenderedTitle: string | null = null
 let queueUnsubscribe: (() => void) | null = null
 let refreshQueued = false
 let isRefreshing = false
+
+ensureQueueRuntimeUi()
 
 function getStatusIcon(statusPrefix: string): "⏳" | "✅" | "" {
   if (statusPrefix.includes("⏳")) return "⏳"
