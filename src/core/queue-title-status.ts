@@ -1,3 +1,5 @@
+import { ensureQueueEventSounds } from "~core/queue-event-sound"
+import { ensureQueueRunLifecycle } from "~core/queue-run-lifecycle"
 import { ensureQueueRuntimeUi } from "~core/queue-runtime-ui"
 import { useQueueStore } from "~stores/queue-store"
 
@@ -14,6 +16,8 @@ let refreshQueued = false
 let isRefreshing = false
 
 ensureQueueRuntimeUi()
+ensureQueueRunLifecycle()
+ensureQueueEventSounds()
 
 function getStatusIcon(statusPrefix: string): "⏳" | "✅" | "" {
   if (statusPrefix.includes("⏳")) return "⏳"
@@ -63,11 +67,6 @@ function ensureQueueTitleSubscription(): void {
   })
 }
 
-/**
- * 保存最近一次由 OPhEL 生成的完整标题渲染函数。
- * 队列状态变化时，只有当前标题仍与受管标题完全一致才会重新渲染，
- * 因而不会覆盖隐私标题、站点原生标题或用户关闭自动重命名后的标题。
- */
 export function registerQueueManagedTitle(
   renderer: ManagedTitleRenderer,
   renderedTitle: string,
@@ -77,10 +76,6 @@ export function registerQueueManagedTitle(
   ensureQueueTitleSubscription()
 }
 
-/**
- * 将标签页状态压缩成无空格形式，并在多步队列中附加 current/total。
- * 普通单次生成仍保持 ⏳标题 / ✅标题。
- */
 export function formatQueueAwareStatusPrefix(statusPrefix: string): string {
   const icon = getStatusIcon(statusPrefix)
   if (!icon) return ""
