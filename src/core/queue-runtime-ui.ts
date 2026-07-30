@@ -14,6 +14,7 @@ let runtimeRoot: HTMLDivElement | null = null
 let domObserver: MutationObserver | null = null
 let queueUnsubscribe: (() => void) | null = null
 let renderFrameId: number | null = null
+let lastRenderKey: string | null = null
 
 function ensureRuntimeStyle(): void {
   if (document.getElementById(RUNTIME_STYLE_ID)) return
@@ -209,6 +210,13 @@ function handleRuntimeAction(event: MouseEvent): void {
   }
 }
 
+function hideRuntimeRoot(root: HTMLDivElement): void {
+  if (root.style.display !== "none") root.style.display = "none"
+  if (root.childNodes.length > 0) root.replaceChildren()
+  delete root.dataset.kind
+  lastRenderKey = null
+}
+
 function renderRuntimeUi(): void {
   if (typeof document === "undefined" || !document.body) return
 
@@ -220,13 +228,26 @@ function renderRuntimeUi(): void {
   const root = ensureRuntimeRoot()
 
   if (!failedItem && !isBlocked) {
-    root.style.display = "none"
-    root.replaceChildren()
+    hideRuntimeRoot(root)
     return
   }
 
   const progressCurrent = failedItem?.ordinal || state.run.current || state.run.completed
   const progress = state.run.total > 0 ? `${progressCurrent}/${state.run.total}` : ""
+  const kind = failedItem ? "failed" : "blocked"
+  const titleText = failedItem
+    ? "发送失败，队列已暂停"
+    : state.run.blockedReason === "editor-unknown"
+      ? "输入框包含无法确认的内容"
+      : "等待输入框清空"
+  const renderKey = [kind, progress, titleText, failedItem?.id || "", failedItem?.content || ""].join("|")
+
+  if (lastRenderKey === renderKey) {
+    root.style.display = "block"
+    positionRuntimeRoot(root)
+    return
+  }
+
   const heading = document.createElement("div")
   heading.className = "ophel-queue-runtime-heading"
 
@@ -236,11 +257,7 @@ function renderRuntimeUi(): void {
   heading.appendChild(progressElement)
 
   const title = document.createElement("span")
-  title.textContent = failedItem
-    ? "发送失败，队列已暂停"
-    : state.run.blockedReason === "editor-unknown"
-      ? "输入框包含无法确认的内容"
-      : "等待输入框清空"
+  title.textContent = titleText
   heading.appendChild(title)
 
   const actions = document.createElement("div")
@@ -271,7 +288,6 @@ function renderRuntimeUi(): void {
 
     actions.append(retry, skip, discard)
     root.replaceChildren(heading, content, actions)
-    root.dataset.kind = "failed"
   } else {
     const focus = document.createElement("button")
     focus.type = "button"
@@ -279,10 +295,11 @@ function renderRuntimeUi(): void {
     focus.textContent = "定位输入框"
     actions.appendChild(focus)
     root.replaceChildren(heading, actions)
-    root.dataset.kind = "blocked"
   }
 
+  root.dataset.kind = kind
   root.style.display = "block"
+  lastRenderKey = renderKey
   positionRuntimeRoot(root)
 }
 
@@ -295,6 +312,22 @@ function scheduleRender(): void {
   })
 }
 
+function isRuntimeMutation(record: MutationRecord): boolean {
+  const target = record.target instanceof Element ? record.target : record.target.parentElement
+  if (target?.closest(`#${RUNTIME_ROOT_ID}`)) return true
+
+  const changedNodes = [...Array.from(record.addedNodes), ...Array.from(record.removedNodes)]
+  return (
+    changedNodes.length > 0 &&
+    changedNodes.every(
+      (node) =>
+        node === runtimeRoot ||
+        (node instanceof Element &&
+          (node.id === RUNTIME_ROOT_ID || node.id === RUNTIME_STYLE_ID)),
+    )
+  )
+}
+
 export function ensureQueueRuntimeUi(): void {
   if (installed || typeof window === "undefined" || typeof document === "undefined") return
 
@@ -305,7 +338,11 @@ export function ensureQueueRuntimeUi(): void {
     ensureRuntimeRoot()
 
     queueUnsubscribe = useQueueStore.subscribe(scheduleRender)
-    domObserver = new MutationObserver(scheduleRender)
+    domObserver = new MutationObserver((records) => {
+      if (records.some((record) => !isRuntimeMutation(record))) {
+        scheduleRender()
+      }
+    })
     domObserver.observe(document.body, { childList: true, subtree: true })
     window.addEventListener("resize", scheduleRender)
     window.addEventListener("scroll", scheduleRender, true)
@@ -336,5 +373,6 @@ export function destroyQueueRuntimeUi(): void {
 
   runtimeRoot?.remove()
   runtimeRoot = null
+  lastRenderKey = null
   installed = false
 }
