@@ -1,5 +1,15 @@
 import { useQueueStore } from "~stores/queue-store"
-import { EVENT_MONITOR_COMPLETE } from "~utils/messaging"
+
+const PATCH_MARKER = Symbol.for("ophel.queue-run-lifecycle-patched")
+
+interface QueueDispatcherRuntime {
+  postSubmitWaitPromise: Promise<void> | null
+  isRunning: () => boolean
+}
+
+type RuntimeMethod = (this: QueueDispatcherRuntime, ...args: unknown[]) => unknown
+
+type MutablePrototype = Record<string | symbol, unknown>
 
 let installed = false
 let completionQueued = false
@@ -25,27 +35,74 @@ function scheduleActiveStepCompletion(): void {
   })
 }
 
-function handleMonitorMessage(event: MessageEvent): void {
-  if (event.origin !== window.location.origin) return
-  if (event.data?.type !== EVENT_MONITOR_COMPLETE) return
-  scheduleActiveStepCompletion()
+function patchQueueDispatcherLifecycle(): void {
+  void import("~core/queue-dispatcher")
+    .then(({ QueueDispatcher }) => {
+      const prototype = QueueDispatcher.prototype as unknown as MutablePrototype
+      if (prototype[PATCH_MARKER]) return
+
+      const startWaitCandidate = prototype.startPostSubmitWait
+      if (typeof startWaitCandidate !== "function") {
+        console.warn("[QueueRunLifecycle] QueueDispatcher wait method was not found")
+        return
+      }
+
+      const originalStartPostSubmitWait = startWaitCandidate as RuntimeMethod
+      prototype.startPostSubmitWait = function (
+        this: QueueDispatcherRuntime,
+        ...args: unknown[]
+      ): unknown {
+        const previousWait = this.postSubmitWaitPromise
+        const result = originalStartPostSubmitWait.apply(this, args)
+        const currentWait = this.postSubmitWaitPromise
+
+        if (currentWait && currentWait !== previousWait) {
+          void currentWait.then(() => {
+            // 安全暂停、对话切换和 dispatcher 销毁都不能冒充正常完成。
+            if (!this.isRunning()) return
+            scheduleActiveStepCompletion()
+          })
+        }
+
+        return result
+      }
+
+      const completeItemCandidate = prototype.completeItem
+      if (typeof completeItemCandidate === "function") {
+        const originalCompleteItem = completeItemCandidate as RuntimeMethod
+        prototype.completeItem = function (
+          this: QueueDispatcherRuntime,
+          itemId: unknown,
+          ...args: unknown[]
+        ): unknown {
+          const item =
+            typeof itemId === "string"
+              ? useQueueStore.getState().items.find((candidate) => candidate.id === itemId)
+              : undefined
+          const result = originalCompleteItem.apply(this, [itemId, ...args])
+
+          // 只插入不发送的任务没有回复等待阶段，应在插入成功后立即完成。
+          if (item?.metadata?.runMode === "insert" && this.isRunning()) {
+            scheduleActiveStepCompletion()
+          }
+
+          return result
+        }
+      }
+
+      prototype[PATCH_MARKER] = true
+    })
+    .catch((error) => {
+      console.warn("[QueueRunLifecycle] Failed to patch QueueDispatcher lifecycle:", error)
+    })
 }
 
 /**
- * 安装队列运行进度监听。
- * 网络监控完成事件是主信号；标题状态观察作为站点兼容后备。
+ * 将队列进度绑定到 QueueDispatcher 自己的稳定回复等待结果。
+ * 不直接使用原始网络 COMPLETE，因为 ChatGPT 思考模式的该事件可能只是 handoff 完成。
  */
 export function ensureQueueRunLifecycle(): void {
   if (installed || typeof window === "undefined") return
   installed = true
-  window.addEventListener("message", handleMonitorMessage)
-}
-
-/**
- * 当 TabManager 已将当前会话判断为完成时，推进当前队列步骤。
- * 这里只接受完成图标，暂停或无活动步骤时不会写入。
- */
-export function observeQueueManagedStatus(statusPrefix: string): void {
-  if (!statusPrefix.includes("✅")) return
-  scheduleActiveStepCompletion()
+  patchQueueDispatcherLifecycle()
 }
