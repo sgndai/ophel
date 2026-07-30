@@ -1,9 +1,10 @@
 import { ensureQueueEventSounds } from "~core/queue-event-sound"
+import { ensureQueueNotificationGuard } from "~core/queue-notification-guard"
 import { ensureQueueRunLifecycle } from "~core/queue-run-lifecycle"
 import { ensureQueueRuntimeUi } from "~core/queue-runtime-ui"
 import { useQueueStore } from "~stores/queue-store"
 
-export const MANAGED_STATUS_TOKEN_SOURCE = "(?:⏳|✅)(?:\\d{1,4}\\/\\d{1,4})?"
+export const MANAGED_STATUS_TOKEN_SOURCE = "(?:⏳|✅|📝)(?:\\d{1,4}\\/\\d{1,4})?"
 
 const MANAGED_TAB_TITLE_ATTR = "data-ophel-managed-tab-title"
 
@@ -18,9 +19,11 @@ let isRefreshing = false
 ensureQueueRuntimeUi()
 ensureQueueRunLifecycle()
 ensureQueueEventSounds()
+ensureQueueNotificationGuard()
 
-function getStatusIcon(statusPrefix: string): "⏳" | "✅" | "" {
+function getStatusIcon(statusPrefix: string): "⏳" | "✅" | "📝" | "" {
   if (statusPrefix.includes("⏳")) return "⏳"
+  if (statusPrefix.includes("📝")) return "📝"
   if (statusPrefix.includes("✅")) return "✅"
   return ""
 }
@@ -86,11 +89,13 @@ export function formatQueueAwareStatusPrefix(statusPrefix: string): string {
   if (!run.runId || run.total <= 1) return icon
 
   const current = Math.min(Math.max(run.current, 0), run.total)
+  const blocked = run.phase === "blocked-editor"
   const hasRemainingWork = queue.items.some(
     (item) => item.status === "pending" || item.status === "sending" || item.status === "failed",
   )
   const isQueueComplete = current >= run.total && !hasRemainingWork && icon === "✅"
-  const effectiveIcon = isQueueComplete ? "✅" : "⏳"
 
-  return `${effectiveIcon}${current}/${run.total}`
+  if (blocked) return `📝${current}/${run.total}`
+
+  return `${isQueueComplete ? "✅" : "⏳"}${current}/${run.total}`
 }
