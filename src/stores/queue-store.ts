@@ -85,6 +85,9 @@ interface QueueState {
   markBlocked: (reason: Exclude<QueueBlockedReason, null>) => void
   clearBlocked: () => void
   markFailed: (itemId: string) => void
+  retryFailed: (itemId: string) => void
+  skipFailed: (itemId: string) => void
+  discardFailed: (itemId: string) => void
   clear: () => void
   pause: () => void
   resume: () => void
@@ -148,6 +151,27 @@ const ensureRun = (state: QueueState): QueueRunState => {
     ...createIdleRunState(),
     runId: createRunId(),
     conversationKey: getConversationKey(),
+  }
+}
+
+const failQueueItem = (state: QueueState, itemId: string): Partial<QueueState> => {
+  const failedItem = state.items.find((item) => item.id === itemId)
+  if (!failedItem) return {}
+
+  return {
+    isPaused: true,
+    isProcessing: false,
+    items: state.items.map((item) =>
+      item.id === itemId ? { ...item, status: "failed" as const } : item,
+    ),
+    run: {
+      ...state.run,
+      current: failedItem.ordinal,
+      activeItemId: itemId,
+      phase: "failed",
+      blockedReason: null,
+      nextDispatchAt: null,
+    },
   }
 }
 
@@ -259,8 +283,28 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
 
   updateStatus: (id, status) =>
     set((state) => {
+      if (status === "failed") return failQueueItem(state, id)
+
+      const target = state.items.find((item) => item.id === id)
+      if (!target) return state
+
       const items = state.items.map((item) => (item.id === id ? { ...item, status } : item))
-      return { items, isProcessing: hasActiveItems(items) }
+      const activeTarget = state.run.activeItemId === id
+      let run = state.run
+
+      if (activeTarget && status === "sent") {
+        run = { ...run, phase: "generating", blockedReason: null }
+      } else if (activeTarget && status === "pending") {
+        run = {
+          ...run,
+          current: run.completed,
+          activeItemId: null,
+          phase: state.isPaused ? "paused" : "idle",
+          blockedReason: null,
+        }
+      }
+
+      return { items, isProcessing: hasActiveItems(items), run }
     }),
 
   markSubmitting: (item) =>
@@ -306,13 +350,18 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
     }),
 
   markBlocked: (reason) =>
-    set((state) => ({
-      run: {
-        ...state.run,
-        phase: state.isPaused ? "paused" : "blocked-editor",
-        blockedReason: reason,
-      },
-    })),
+    set((state) => {
+      const phase = state.isPaused ? "paused" : "blocked-editor"
+      if (state.run.phase === phase && state.run.blockedReason === reason) return state
+
+      return {
+        run: {
+          ...state.run,
+          phase,
+          blockedReason: reason,
+        },
+      }
+    }),
 
   clearBlocked: () =>
     set((state) => {
@@ -327,20 +376,93 @@ export const useQueueStore = create<QueueState>()((set, get) => ({
       }
     }),
 
-  markFailed: (itemId) =>
-    set((state) => ({
-      isPaused: true,
-      isProcessing: false,
-      items: state.items.map((item) =>
-        item.id === itemId ? { ...item, status: "failed" as const } : item,
-      ),
-      run: {
-        ...state.run,
-        activeItemId: itemId,
-        phase: "failed",
-        blockedReason: null,
-      },
-    })),
+  markFailed: (itemId) => set((state) => failQueueItem(state, itemId)),
+
+  retryFailed: (itemId) =>
+    set((state) => {
+      const failedItem = state.items.find(
+        (item) => item.id === itemId && item.status === "failed",
+      )
+      if (!failedItem) return state
+
+      return {
+        isPaused: false,
+        isProcessing: false,
+        items: state.items.map((item) =>
+          item.id === itemId ? { ...item, status: "pending" as const } : item,
+        ),
+        run: {
+          ...state.run,
+          current: failedItem.ordinal,
+          activeItemId: null,
+          phase: "idle",
+          blockedReason: null,
+          nextDispatchAt: null,
+        },
+      }
+    }),
+
+  skipFailed: (itemId) =>
+    set((state) => {
+      const failedItem = state.items.find(
+        (item) => item.id === itemId && item.status === "failed",
+      )
+      if (!failedItem) return state
+
+      const items = state.items.filter((item) => item.id !== itemId)
+      const completed = Math.max(state.run.completed, failedItem.ordinal)
+      const hasActive = hasActiveItems(items)
+      const finished = state.run.total > 0 && completed >= state.run.total && !hasActive
+
+      return {
+        items,
+        isPaused: false,
+        isProcessing: hasActive,
+        run: {
+          ...state.run,
+          current: failedItem.ordinal,
+          completed,
+          activeItemId: null,
+          phase: finished ? "completed" : "idle",
+          blockedReason: null,
+          nextDispatchAt: null,
+        },
+      }
+    }),
+
+  discardFailed: (itemId) =>
+    set((state) => {
+      const failedItem = state.items.find(
+        (item) => item.id === itemId && item.status === "failed",
+      )
+      if (!failedItem) return state
+
+      const items = state.items
+        .filter((item) => item.id !== itemId)
+        .map((item) =>
+          item.runId === failedItem.runId && item.ordinal > failedItem.ordinal
+            ? { ...item, ordinal: item.ordinal - 1 }
+            : item,
+        )
+      const total = Math.max(state.run.completed, state.run.total - 1)
+      const hasActive = hasActiveItems(items)
+      const finished = total > 0 && state.run.completed >= total && !hasActive
+
+      return {
+        items,
+        isPaused: !finished && hasActive,
+        isProcessing: false,
+        run: {
+          ...state.run,
+          total,
+          current: Math.min(state.run.completed, total),
+          activeItemId: null,
+          phase: finished ? "completed" : hasActive ? "paused" : "idle",
+          blockedReason: null,
+          nextDispatchAt: null,
+        },
+      }
+    }),
 
   clear: () =>
     set({
