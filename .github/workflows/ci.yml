@@ -24,9 +24,6 @@ on:
       - "LICENSE"
       - ".gitignore"
 
-permissions:
-  contents: write
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -38,8 +35,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -53,34 +48,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Format branch
-        id: format
-        shell: bash
-        run: |
-          pnpm format
-          if git diff --quiet; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add --all
-          git commit -m "style: format queue progress changes"
-          git push origin "HEAD:${GITHUB_HEAD_REF}"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-
       - name: 🎨 Check Code Format (Prettier)
-        if: steps.format.outputs.changed == 'false'
         run: pnpm format:check
 
       - name: 🔍 Lint Code (ESLint)
-        if: steps.format.outputs.changed == 'false'
         run: pnpm lint:check
 
       - name: 📐 Type Check (TypeScript)
-        if: steps.format.outputs.changed == 'false'
         run: pnpm typecheck
 
       - name: 🏗️ Verify Build
-        if: steps.format.outputs.changed == 'false'
         run: pnpm build
